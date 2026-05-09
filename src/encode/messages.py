@@ -14,7 +14,7 @@ import mimetypes
 from collections.abc import Iterable, Iterator, Sequence
 from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from pydantic import BaseModel, ConfigDict
 
@@ -193,15 +193,16 @@ def _coerce_content(content: Any) -> Any:
     return content
 
 
-class Messages:
+class Messages(Sequence[dict[str, Any]]):
     """Mutable conversation container.
 
     Pass to ``relay()`` / ``relay_async()`` as ``messages=`` and the SDK will
     append the new turns in place after the loop completes. Plain lists work
     too — they are not mutated.
 
-    Quacks like a list (``__len__``, ``__iter__``, ``__getitem__``, ``__bool__``)
-    and exposes chainable adders for ergonomic construction.
+    Implements :class:`collections.abc.Sequence`, so it satisfies
+    ``Sequence[Any]`` parameter types and supports ``len()``, iteration,
+    indexing, slicing, ``in``, ``index()``, ``count()``, etc.
 
     Example:
         m = (
@@ -282,7 +283,13 @@ class Messages:
     def __iter__(self) -> Iterator[dict[str, Any]]:
         return iter(self._items)
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
+    @overload
+    def __getitem__(self, idx: int) -> dict[str, Any]: ...
+    @overload
+    def __getitem__(self, idx: slice) -> list[dict[str, Any]]: ...
+    def __getitem__(
+        self, idx: int | slice
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         return self._items[idx]
 
     def __bool__(self) -> bool:

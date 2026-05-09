@@ -232,7 +232,7 @@ print(out.tool_calls[0].name)  # "get_weather"
 print(out.tool_calls[0].result)  # {"city": "Denver", "temp_f": 72}
 ```
 
-The loop runs until the model stops calling tools (or hits `max_tool_iterations`, default `8`).
+The loop runs until the model stops calling tools. There is no cap by default — pass `max_tool_iterations=N` if you want to bail on a runaway model. See [Capping iterations](#capping-iterations-optional) below.
 
 ### What the SDK does for you
 
@@ -406,7 +406,7 @@ The tool loop and intercept work identically across both endpoints — `function
 
 ## Streaming
 
-Set `stream=True` and iterate the handle:
+Set `stream=True` and iterate the handle. The handle yields `StreamEvent` objects — parsed Python values, not raw SSE bytes. The upstream HTTP connection is held open with `httpx.stream()`, so backpressure works end-to-end.
 
 ```python
 handle = encode.relay(
@@ -419,14 +419,82 @@ for event in handle:
         print(event.data, end="", flush=True)
 ```
 
-For `/v1/responses`, events use the typed names from the spec (`response.output_text.delta`, `response.completed`, etc.):
+### `StreamEvent`
+
+Every event carries three fields:
+
+| field   | type             | meaning                                                                 |
+| ------- | ---------------- | ----------------------------------------------------------------------- |
+| `type`  | `str`            | event kind (see tables below)                                           |
+| `data`  | `Any`            | the parsed payload — a `str` for text deltas, `dict`/`list` otherwise   |
+| `raw`   | `dict` \| `None` | the full upstream chunk as parsed JSON (re-serialize this if proxying)  |
+
+### Event types — `/v1/chat/completions`
+
+| `event.type`         | `event.data`                                                          |
+| -------------------- | --------------------------------------------------------------------- |
+| `content.delta`      | `str` — the next token of assistant text                              |
+| `tool_calls.delta`   | `list[dict]` — partial tool-call fragments (raw upstream deltas)      |
+| `tool_call.start`    | `{id, name, arguments: dict, iteration}` — fully assembled tool call about to run |
+| `tool_call.result`   | `{id, result, result_serialized, duration_ms, iteration}` — tool returned successfully |
+| `tool_call.error`    | `{id, error, iteration}` — tool raised; loop continues                |
+| `iteration.end`      | `{iteration, had_tool_calls}` — one tool-loop iteration completed     |
+| `finish`             | `str` — final finish reason (`"stop"`, `"length"`, `"tool_calls"`, …) |
+
+The new `tool_call.*` events fire **only when `tools=` is set**. Without tools, you only see `content.delta` / `finish`. The raw `tool_calls.delta` events still fire when the model emits tool-call fragments — most chat-UI consumers can ignore them and key off `tool_call.start` / `tool_call.result` instead.
+
+### Event types — `/v1/responses`
+
+For the responses endpoint, upstream events are passed through with their `type` field intact (`response.output_text.delta`, `response.completed`, …) and `event.data` set to the entire parsed event dict. When `tools=` is set, encode also synthesizes `content.delta` (mapped from `response.output_text.delta`) and the same `tool_call.start` / `tool_call.result` / `tool_call.error` / `iteration.end` events as chat, so a single consumer can handle both endpoints uniformly.
 
 ```python
 for event in encode.relay(model="m", input="hi", stream=True):
     print(event.type, event.data)
 ```
 
-> Streaming with auto-tool-loop is not supported in v0.1.0 — you can only iterate streams when `tools=None`. Use `stream=False` with tools, then re-issue a streaming call yourself if you want to stream the final answer.
+### Streaming with tools (auto-loop)
+
+Pass `tools=` and `stream=True` together. The SDK runs the same auto-tool-loop as `stream=False` but yields events as the iteration proceeds — content tokens forward to the consumer in real time, and each tool dispatch fires `tool_call.start` / `tool_call.result` (or `.error`) events the consumer can render in a chat UI.
+
+```python
+def get_weather(city: str) -> dict:
+    """Get current weather by city."""
+    return {"city": city, "temp_f": 72}
+
+for ev in encode.relay(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "What's the weather in Denver?"}],
+    tools=[get_weather],
+    stream=True,
+):
+    if ev.type == "content.delta":
+        print(ev.data, end="", flush=True)
+    elif ev.type == "tool_call.start":
+        print(f"\n[calling {ev.data['name']}({ev.data['arguments']})]")
+    elif ev.type == "tool_call.result":
+        print(f"[result: {ev.data['result']}]")
+    elif ev.type == "tool_call.error":
+        print(f"[tool error: {ev.data['error']}]")
+```
+
+`max_tool_iterations` still works — passing a cap raises `MaxToolIterationsError` (with `.partial` carrying the streamed-so-far state) the moment the cap is exceeded.
+
+`Messages` containers passed as `messages=` are mutated when the stream finishes, just like the non-stream path. If the consumer abandons the iterator early (breaks out of the loop), the container is **not** updated — drain the iterator if you want the absorption.
+
+### Async streaming
+
+Use `relay_async` with `async for`:
+
+```python
+handle = encode.relay_async(model="m", messages=[...], tools=[get_weather], stream=True)
+async for event in handle:
+    if event.type == "content.delta":
+        print(event.data, end="", flush=True)
+```
+
+### Restrictions
+
+- **`response_format` is not supported when streaming.** Combining the two raises `ValueError` immediately — structured output isn't meaningful mid-stream.
 
 ---
 
@@ -691,7 +759,7 @@ async for event in AsyncRelayHandle: ...
 # Models
 encode.Message, Messages, Conversation, TextContent, ImageContent, AudioContent
 encode.RelayResponse, WhisperResponse, ToolCallRecord, AssistantTurn, Usage
-encode.InterceptEvent
+encode.InterceptEvent, StreamEvent
 
 # Errors (all inherit CourierError)
 encode.AuthError, InvalidRequestError, InvalidToolCallError, InvalidToolChoiceError,

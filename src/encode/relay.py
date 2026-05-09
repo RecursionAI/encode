@@ -7,7 +7,7 @@ Single entry point that:
 - supports response_format (Pydantic model or dict) for structured outputs
 - exposes intercept callbacks via both ``relay(...).intercept(cb)`` and
   ``on_intercept=`` kwarg, with explicit ``event.stop()`` for early termination
-- supports streaming (final iteration only when tools are present)
+- supports streaming, including across the full tool-call loop
 """
 
 from __future__ import annotations
@@ -25,8 +25,10 @@ from . import _http, errors, tools
 from ._schema import pydantic_to_response_format
 from ._streaming import (
     StreamEvent,
+    accumulate_chat_tool_calls,
     aiter_chat_completions,
     aiter_responses,
+    finalize_chat_tool_calls,
     iter_chat_completions,
     iter_responses,
 )
@@ -1016,21 +1018,41 @@ async def _loop_responses_async(
 
 
 # ---------------------------------------------------------------------------
-# Streaming entrypoints (no-tools path)
+# Streaming entrypoints
+#
+# Each iteration opens an upstream SSE stream. Content tokens flow to the
+# consumer immediately; tool_call deltas are buffered. When the upstream stream
+# closes we either dispatch tools and loop, or yield a final ``finish`` event
+# and stop.
 # ---------------------------------------------------------------------------
 
 
 def _execute_sync_stream(
     client: Any, c: _RelayConfig, interceptors: list[InterceptCallback]
 ) -> Iterator[StreamEvent]:
-    if c.tools:
-        raise ValueError(
-            "Iterating a streaming RelayHandle with tools is not supported. "
-            "Use stream=False with tools, or call relay() without tools to stream."
-        )
-    tool_dicts, _ = tools.build_tools(None, web_search=c.web_search)
+    tool_dicts, tool_index = tools.build_tools(c.tools, web_search=c.web_search)
     if c.endpoint == "chat":
-        history = to_chat_messages(c.messages)
+        yield from _stream_chat_sync(client, c, interceptors, tool_dicts, tool_index)
+    else:
+        yield from _stream_responses_sync(client, c, interceptors, tool_dicts, tool_index)
+
+
+def _stream_chat_sync(
+    client: Any,
+    c: _RelayConfig,
+    interceptors: list[InterceptCallback],
+    tool_dicts: list[dict[str, Any]],
+    tool_index: dict[str, Callable[..., Any]],
+) -> Iterator[StreamEvent]:
+    history: list[dict[str, Any]] = list(to_chat_messages(c.messages))
+    all_tool_calls: list[ToolCallRecord] = []
+    last_raw: Any = None
+    final_content: str | None = None
+    finish_reason: str | None = None
+    iterations = 0
+
+    for iteration in itertools.count():
+        iterations = iteration + 1
         payload = _build_chat_payload(
             model=c.model,
             messages=history,
@@ -1039,13 +1061,176 @@ def _execute_sync_stream(
             stream=True,
             extra=_common_extras(c),
         )
+
+        content_parts: list[str] = []
+        tool_buf: dict[int, dict[str, Any]] = {}
+        iter_finish: str | None = None
+        last_chunk: Any = None
+
         with client._http.stream(
             "POST", "/v1/chat/completions", json=payload
         ) as resp:
             _http.raise_for_status(resp)
-            yield from iter_chat_completions(resp)
-    else:
-        input_items = to_responses_input(c.messages, input=c.input)
+            for ev in iter_chat_completions(resp):
+                last_chunk = ev.raw
+                if ev.type == "content.delta":
+                    content_parts.append(ev.data)
+                    yield ev
+                elif ev.type == "tool_calls.delta":
+                    accumulate_chat_tool_calls(tool_buf, ev.data)
+                    yield ev
+                elif ev.type == "finish":
+                    iter_finish = ev.data
+
+        last_raw = last_chunk
+        finish_reason = iter_finish
+        content = "".join(content_parts) if content_parts else None
+        final_content = content
+        tcs = finalize_chat_tool_calls(tool_buf)
+
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
+        if tcs:
+            assistant_msg["tool_calls"] = tcs
+        history.append(assistant_msg)
+
+        if not tcs:
+            yield StreamEvent(type="finish", data=finish_reason, raw=last_chunk)
+            break
+
+        records: list[ToolCallRecord] = []
+        for tc in tcs:
+            tc_id = tc.get("id") or ""
+            fn_name = (tc.get("function") or {}).get("name") or ""
+            args_raw = (tc.get("function") or {}).get("arguments") or "{}"
+            args = tools.parse_arguments(args_raw)
+            yield StreamEvent(
+                type="tool_call.start",
+                data={
+                    "id": tc_id,
+                    "name": fn_name,
+                    "arguments": args,
+                    "iteration": iteration,
+                },
+            )
+            fn = tool_index.get(fn_name)
+            err: str | None
+            if fn is None:
+                err = f"no Python callable bound for tool '{fn_name}'"
+                result_obj: Any = {"error": err}
+                duration = 0.0
+                yield StreamEvent(
+                    type="tool_call.error",
+                    data={"id": tc_id, "error": err, "iteration": iteration},
+                )
+            else:
+                result_obj, err, duration = tools.safe_call(fn, args)
+                if err is None:
+                    yield StreamEvent(
+                        type="tool_call.result",
+                        data={
+                            "id": tc_id,
+                            "result": result_obj,
+                            "result_serialized": tools.serialize_tool_result(
+                                result_obj
+                            ),
+                            "duration_ms": duration,
+                            "iteration": iteration,
+                        },
+                    )
+                else:
+                    yield StreamEvent(
+                        type="tool_call.error",
+                        data={"id": tc_id, "error": err, "iteration": iteration},
+                    )
+            serialized = tools.serialize_tool_result(result_obj)
+            history.append(
+                {"role": "tool", "tool_call_id": tc_id, "content": serialized}
+            )
+            rec = ToolCallRecord(
+                id=tc_id,
+                name=fn_name,
+                arguments=args,
+                arguments_raw=args_raw,
+                result=result_obj if err is None else None,
+                result_serialized=serialized,
+                error=err,
+                iteration=iteration,
+                duration_ms=duration,
+            )
+            records.append(rec)
+            all_tool_calls.append(rec)
+
+        will_continue = (
+            c.max_tool_iterations is None or iterations < c.max_tool_iterations
+        )
+        intercept = InterceptEvent(
+            iteration=iteration,
+            endpoint="chat",
+            assistant_turn=AssistantTurn(content=content, tool_calls=records),
+            tool_calls=records,
+            messages_so_far=list(history),
+            raw_response=last_chunk if isinstance(last_chunk, dict) else {},
+            will_continue=will_continue,
+        )
+        stopped = _fire_intercepts_sync(interceptors, intercept)
+        yield StreamEvent(
+            type="iteration.end",
+            data={"iteration": iteration, "had_tool_calls": True},
+        )
+        if stopped:
+            yield StreamEvent(type="finish", data=finish_reason, raw=last_chunk)
+            break
+        if c.max_tool_iterations is not None and iterations >= c.max_tool_iterations:
+            partial = _build_response(
+                "chat",
+                c.model,
+                final_content,
+                history,
+                all_tool_calls,
+                iterations,
+                finish_reason,
+                last_raw,
+                None,
+                None,
+            )
+            raise errors.MaxToolIterationsError(
+                f"tool loop exceeded max_tool_iterations={c.max_tool_iterations}",
+                partial=partial,
+            )
+
+    final_resp = _build_response(
+        "chat",
+        c.model,
+        final_content,
+        history,
+        all_tool_calls,
+        iterations,
+        finish_reason,
+        last_raw,
+        None,
+        None,
+    )
+    _absorb_into_messages(c.messages, final_resp)
+
+
+def _stream_responses_sync(
+    client: Any,
+    c: _RelayConfig,
+    interceptors: list[InterceptCallback],
+    tool_dicts: list[dict[str, Any]],
+    tool_index: dict[str, Callable[..., Any]],
+) -> Iterator[StreamEvent]:
+    input_items: list[dict[str, Any]] = list(
+        to_responses_input(c.messages, input=c.input)
+    )
+    history: list[dict[str, Any]] = list(to_chat_messages(c.messages))
+    all_tool_calls: list[ToolCallRecord] = []
+    last_raw: Any = None
+    final_content: str | None = None
+    iterations = 0
+
+    for iteration in itertools.count():
+        iterations = iteration + 1
         payload = _build_responses_payload(
             model=c.model,
             input_items=input_items,
@@ -1054,22 +1239,192 @@ def _execute_sync_stream(
             stream=True,
             extra=_common_extras(c),
         )
-        with client._http.stream("POST", "/v1/responses", json=payload) as resp:
+
+        completed_response: Any = None
+        with client._http.stream(
+            "POST", "/v1/responses", json=payload
+        ) as resp:
             _http.raise_for_status(resp)
-            yield from iter_responses(resp)
+            for ev in iter_responses(resp):
+                if ev.type == "response.output_text.delta":
+                    delta = (ev.data or {}).get("delta", "")
+                    if delta:
+                        yield StreamEvent(
+                            type="content.delta", data=delta, raw=ev.raw
+                        )
+                if ev.type == "response.completed":
+                    completed_response = (ev.data or {}).get("response")
+                yield ev
+
+        last_raw = completed_response or last_raw
+        text, function_calls, output_items = _extract_responses_assistant(
+            completed_response or {}
+        )
+        final_content = text
+
+        for item in output_items:
+            input_items.append(item)
+        if text is not None:
+            history.append({"role": "assistant", "content": text})
+
+        if not function_calls:
+            yield StreamEvent(type="finish", data="completed", raw=completed_response)
+            break
+
+        records: list[ToolCallRecord] = []
+        for fc in function_calls:
+            call_id = fc.get("call_id") or fc.get("id") or ""
+            fn_name = fc.get("name") or ""
+            args_raw = fc.get("arguments") or "{}"
+            args = tools.parse_arguments(args_raw)
+            yield StreamEvent(
+                type="tool_call.start",
+                data={
+                    "id": call_id,
+                    "name": fn_name,
+                    "arguments": args,
+                    "iteration": iteration,
+                },
+            )
+            fn = tool_index.get(fn_name)
+            if fn is None:
+                err: str | None = f"no Python callable bound for tool '{fn_name}'"
+                result_obj: Any = {"error": err}
+                duration = 0.0
+                yield StreamEvent(
+                    type="tool_call.error",
+                    data={"id": call_id, "error": err, "iteration": iteration},
+                )
+            else:
+                result_obj, err, duration = tools.safe_call(fn, args)
+                if err is None:
+                    yield StreamEvent(
+                        type="tool_call.result",
+                        data={
+                            "id": call_id,
+                            "result": result_obj,
+                            "result_serialized": tools.serialize_tool_result(
+                                result_obj
+                            ),
+                            "duration_ms": duration,
+                            "iteration": iteration,
+                        },
+                    )
+                else:
+                    yield StreamEvent(
+                        type="tool_call.error",
+                        data={"id": call_id, "error": err, "iteration": iteration},
+                    )
+            serialized = tools.serialize_tool_result(result_obj)
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": serialized,
+                }
+            )
+            history.append(
+                {"role": "tool", "tool_call_id": call_id, "content": serialized}
+            )
+            rec = ToolCallRecord(
+                id=call_id,
+                name=fn_name,
+                arguments=args,
+                arguments_raw=args_raw,
+                result=result_obj if err is None else None,
+                result_serialized=serialized,
+                error=err,
+                iteration=iteration,
+                duration_ms=duration,
+            )
+            records.append(rec)
+            all_tool_calls.append(rec)
+
+        will_continue = (
+            c.max_tool_iterations is None or iterations < c.max_tool_iterations
+        )
+        intercept = InterceptEvent(
+            iteration=iteration,
+            endpoint="responses",
+            assistant_turn=AssistantTurn(content=text, tool_calls=records),
+            tool_calls=records,
+            messages_so_far=list(history),
+            raw_response=completed_response if isinstance(completed_response, dict) else {},
+            will_continue=will_continue,
+        )
+        stopped = _fire_intercepts_sync(interceptors, intercept)
+        yield StreamEvent(
+            type="iteration.end",
+            data={"iteration": iteration, "had_tool_calls": True},
+        )
+        if stopped:
+            yield StreamEvent(type="finish", data="stopped", raw=completed_response)
+            break
+        if c.max_tool_iterations is not None and iterations >= c.max_tool_iterations:
+            partial = _build_response(
+                "responses",
+                c.model,
+                final_content,
+                history,
+                all_tool_calls,
+                iterations,
+                None,
+                last_raw,
+                None,
+                None,
+            )
+            raise errors.MaxToolIterationsError(
+                f"tool loop exceeded max_tool_iterations={c.max_tool_iterations}",
+                partial=partial,
+            )
+
+    final_resp = _build_response(
+        "responses",
+        c.model,
+        final_content,
+        history,
+        all_tool_calls,
+        iterations,
+        None,
+        last_raw,
+        None,
+        None,
+    )
+    _absorb_into_messages(c.messages, final_resp)
 
 
 async def _execute_async_stream(
     client: Any, c: _RelayConfig, interceptors: list[AsyncInterceptCallback]
 ) -> AsyncIterator[StreamEvent]:
-    if c.tools:
-        raise ValueError(
-            "Iterating a streaming AsyncRelayHandle with tools is not supported. "
-            "Use stream=False with tools, or call relay_async() without tools to stream."
-        )
-    tool_dicts, _ = tools.build_tools(None, web_search=c.web_search)
+    tool_dicts, tool_index = tools.build_tools(c.tools, web_search=c.web_search)
     if c.endpoint == "chat":
-        history = to_chat_messages(c.messages)
+        async for ev in _stream_chat_async(
+            client, c, interceptors, tool_dicts, tool_index
+        ):
+            yield ev
+    else:
+        async for ev in _stream_responses_async(
+            client, c, interceptors, tool_dicts, tool_index
+        ):
+            yield ev
+
+
+async def _stream_chat_async(
+    client: Any,
+    c: _RelayConfig,
+    interceptors: list[AsyncInterceptCallback],
+    tool_dicts: list[dict[str, Any]],
+    tool_index: dict[str, Callable[..., Any]],
+) -> AsyncIterator[StreamEvent]:
+    history: list[dict[str, Any]] = list(to_chat_messages(c.messages))
+    all_tool_calls: list[ToolCallRecord] = []
+    last_raw: Any = None
+    final_content: str | None = None
+    finish_reason: str | None = None
+    iterations = 0
+
+    for iteration in itertools.count():
+        iterations = iteration + 1
         payload = _build_chat_payload(
             model=c.model,
             messages=history,
@@ -1078,14 +1433,176 @@ async def _execute_async_stream(
             stream=True,
             extra=_common_extras(c),
         )
+
+        content_parts: list[str] = []
+        tool_buf: dict[int, dict[str, Any]] = {}
+        iter_finish: str | None = None
+        last_chunk: Any = None
+
         async with client._http.stream(
             "POST", "/v1/chat/completions", json=payload
         ) as resp:
             _http.raise_for_status(resp)
             async for ev in aiter_chat_completions(resp):
-                yield ev
-    else:
-        input_items = to_responses_input(c.messages, input=c.input)
+                last_chunk = ev.raw
+                if ev.type == "content.delta":
+                    content_parts.append(ev.data)
+                    yield ev
+                elif ev.type == "tool_calls.delta":
+                    accumulate_chat_tool_calls(tool_buf, ev.data)
+                    yield ev
+                elif ev.type == "finish":
+                    iter_finish = ev.data
+
+        last_raw = last_chunk
+        finish_reason = iter_finish
+        content = "".join(content_parts) if content_parts else None
+        final_content = content
+        tcs = finalize_chat_tool_calls(tool_buf)
+
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
+        if tcs:
+            assistant_msg["tool_calls"] = tcs
+        history.append(assistant_msg)
+
+        if not tcs:
+            yield StreamEvent(type="finish", data=finish_reason, raw=last_chunk)
+            break
+
+        records: list[ToolCallRecord] = []
+        for tc in tcs:
+            tc_id = tc.get("id") or ""
+            fn_name = (tc.get("function") or {}).get("name") or ""
+            args_raw = (tc.get("function") or {}).get("arguments") or "{}"
+            args = tools.parse_arguments(args_raw)
+            yield StreamEvent(
+                type="tool_call.start",
+                data={
+                    "id": tc_id,
+                    "name": fn_name,
+                    "arguments": args,
+                    "iteration": iteration,
+                },
+            )
+            fn = tool_index.get(fn_name)
+            err: str | None
+            if fn is None:
+                err = f"no Python callable bound for tool '{fn_name}'"
+                result_obj: Any = {"error": err}
+                duration = 0.0
+                yield StreamEvent(
+                    type="tool_call.error",
+                    data={"id": tc_id, "error": err, "iteration": iteration},
+                )
+            else:
+                result_obj, err, duration = await tools.safe_call_async(fn, args)
+                if err is None:
+                    yield StreamEvent(
+                        type="tool_call.result",
+                        data={
+                            "id": tc_id,
+                            "result": result_obj,
+                            "result_serialized": tools.serialize_tool_result(
+                                result_obj
+                            ),
+                            "duration_ms": duration,
+                            "iteration": iteration,
+                        },
+                    )
+                else:
+                    yield StreamEvent(
+                        type="tool_call.error",
+                        data={"id": tc_id, "error": err, "iteration": iteration},
+                    )
+            serialized = tools.serialize_tool_result(result_obj)
+            history.append(
+                {"role": "tool", "tool_call_id": tc_id, "content": serialized}
+            )
+            rec = ToolCallRecord(
+                id=tc_id,
+                name=fn_name,
+                arguments=args,
+                arguments_raw=args_raw,
+                result=result_obj if err is None else None,
+                result_serialized=serialized,
+                error=err,
+                iteration=iteration,
+                duration_ms=duration,
+            )
+            records.append(rec)
+            all_tool_calls.append(rec)
+
+        will_continue = (
+            c.max_tool_iterations is None or iterations < c.max_tool_iterations
+        )
+        intercept = InterceptEvent(
+            iteration=iteration,
+            endpoint="chat",
+            assistant_turn=AssistantTurn(content=content, tool_calls=records),
+            tool_calls=records,
+            messages_so_far=list(history),
+            raw_response=last_chunk if isinstance(last_chunk, dict) else {},
+            will_continue=will_continue,
+        )
+        stopped = await _fire_intercepts_async(interceptors, intercept)
+        yield StreamEvent(
+            type="iteration.end",
+            data={"iteration": iteration, "had_tool_calls": True},
+        )
+        if stopped:
+            yield StreamEvent(type="finish", data=finish_reason, raw=last_chunk)
+            break
+        if c.max_tool_iterations is not None and iterations >= c.max_tool_iterations:
+            partial = _build_response(
+                "chat",
+                c.model,
+                final_content,
+                history,
+                all_tool_calls,
+                iterations,
+                finish_reason,
+                last_raw,
+                None,
+                None,
+            )
+            raise errors.MaxToolIterationsError(
+                f"tool loop exceeded max_tool_iterations={c.max_tool_iterations}",
+                partial=partial,
+            )
+
+    final_resp = _build_response(
+        "chat",
+        c.model,
+        final_content,
+        history,
+        all_tool_calls,
+        iterations,
+        finish_reason,
+        last_raw,
+        None,
+        None,
+    )
+    _absorb_into_messages(c.messages, final_resp)
+
+
+async def _stream_responses_async(
+    client: Any,
+    c: _RelayConfig,
+    interceptors: list[AsyncInterceptCallback],
+    tool_dicts: list[dict[str, Any]],
+    tool_index: dict[str, Callable[..., Any]],
+) -> AsyncIterator[StreamEvent]:
+    input_items: list[dict[str, Any]] = list(
+        to_responses_input(c.messages, input=c.input)
+    )
+    history: list[dict[str, Any]] = list(to_chat_messages(c.messages))
+    all_tool_calls: list[ToolCallRecord] = []
+    last_raw: Any = None
+    final_content: str | None = None
+    iterations = 0
+
+    for iteration in itertools.count():
+        iterations = iteration + 1
         payload = _build_responses_payload(
             model=c.model,
             input_items=input_items,
@@ -1094,10 +1611,159 @@ async def _execute_async_stream(
             stream=True,
             extra=_common_extras(c),
         )
-        async with client._http.stream("POST", "/v1/responses", json=payload) as resp:
+
+        completed_response: Any = None
+        async with client._http.stream(
+            "POST", "/v1/responses", json=payload
+        ) as resp:
             _http.raise_for_status(resp)
             async for ev in aiter_responses(resp):
+                if ev.type == "response.output_text.delta":
+                    delta = (ev.data or {}).get("delta", "")
+                    if delta:
+                        yield StreamEvent(
+                            type="content.delta", data=delta, raw=ev.raw
+                        )
+                if ev.type == "response.completed":
+                    completed_response = (ev.data or {}).get("response")
                 yield ev
+
+        last_raw = completed_response or last_raw
+        text, function_calls, output_items = _extract_responses_assistant(
+            completed_response or {}
+        )
+        final_content = text
+
+        for item in output_items:
+            input_items.append(item)
+        if text is not None:
+            history.append({"role": "assistant", "content": text})
+
+        if not function_calls:
+            yield StreamEvent(type="finish", data="completed", raw=completed_response)
+            break
+
+        records: list[ToolCallRecord] = []
+        for fc in function_calls:
+            call_id = fc.get("call_id") or fc.get("id") or ""
+            fn_name = fc.get("name") or ""
+            args_raw = fc.get("arguments") or "{}"
+            args = tools.parse_arguments(args_raw)
+            yield StreamEvent(
+                type="tool_call.start",
+                data={
+                    "id": call_id,
+                    "name": fn_name,
+                    "arguments": args,
+                    "iteration": iteration,
+                },
+            )
+            fn = tool_index.get(fn_name)
+            err: str | None
+            if fn is None:
+                err = f"no Python callable bound for tool '{fn_name}'"
+                result_obj: Any = {"error": err}
+                duration = 0.0
+                yield StreamEvent(
+                    type="tool_call.error",
+                    data={"id": call_id, "error": err, "iteration": iteration},
+                )
+            else:
+                result_obj, err, duration = await tools.safe_call_async(fn, args)
+                if err is None:
+                    yield StreamEvent(
+                        type="tool_call.result",
+                        data={
+                            "id": call_id,
+                            "result": result_obj,
+                            "result_serialized": tools.serialize_tool_result(
+                                result_obj
+                            ),
+                            "duration_ms": duration,
+                            "iteration": iteration,
+                        },
+                    )
+                else:
+                    yield StreamEvent(
+                        type="tool_call.error",
+                        data={"id": call_id, "error": err, "iteration": iteration},
+                    )
+            serialized = tools.serialize_tool_result(result_obj)
+            input_items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": serialized,
+                }
+            )
+            history.append(
+                {"role": "tool", "tool_call_id": call_id, "content": serialized}
+            )
+            rec = ToolCallRecord(
+                id=call_id,
+                name=fn_name,
+                arguments=args,
+                arguments_raw=args_raw,
+                result=result_obj if err is None else None,
+                result_serialized=serialized,
+                error=err,
+                iteration=iteration,
+                duration_ms=duration,
+            )
+            records.append(rec)
+            all_tool_calls.append(rec)
+
+        will_continue = (
+            c.max_tool_iterations is None or iterations < c.max_tool_iterations
+        )
+        intercept = InterceptEvent(
+            iteration=iteration,
+            endpoint="responses",
+            assistant_turn=AssistantTurn(content=text, tool_calls=records),
+            tool_calls=records,
+            messages_so_far=list(history),
+            raw_response=completed_response if isinstance(completed_response, dict) else {},
+            will_continue=will_continue,
+        )
+        stopped = await _fire_intercepts_async(interceptors, intercept)
+        yield StreamEvent(
+            type="iteration.end",
+            data={"iteration": iteration, "had_tool_calls": True},
+        )
+        if stopped:
+            yield StreamEvent(type="finish", data="stopped", raw=completed_response)
+            break
+        if c.max_tool_iterations is not None and iterations >= c.max_tool_iterations:
+            partial = _build_response(
+                "responses",
+                c.model,
+                final_content,
+                history,
+                all_tool_calls,
+                iterations,
+                None,
+                last_raw,
+                None,
+                None,
+            )
+            raise errors.MaxToolIterationsError(
+                f"tool loop exceeded max_tool_iterations={c.max_tool_iterations}",
+                partial=partial,
+            )
+
+    final_resp = _build_response(
+        "responses",
+        c.model,
+        final_content,
+        history,
+        all_tool_calls,
+        iterations,
+        None,
+        last_raw,
+        None,
+        None,
+    )
+    _absorb_into_messages(c.messages, final_resp)
 
 
 # ---------------------------------------------------------------------------

@@ -95,3 +95,46 @@ async def aiter_responses(resp: httpx.Response) -> AsyncIterator[StreamEvent]:
             continue
         etype = event.get("type", "unknown")
         yield StreamEvent(type=etype, data=event, raw=event)
+
+
+# ---------------------------------------------------------------------------
+# Chat tool-call delta accumulator
+#
+# Chat completions emits tool calls as a sequence of partial deltas keyed by
+# `index`. Each chunk may contribute id/type/function.name on first arrival
+# and append more bytes to function.arguments on subsequent chunks. The relay
+# tool-loop needs the assembled list at end-of-stream to dispatch tools.
+# ---------------------------------------------------------------------------
+
+
+def accumulate_chat_tool_calls(
+    buf: dict[int, dict[str, Any]],
+    deltas: list[dict[str, Any]] | None,
+) -> None:
+    """Merge a chunk's `tool_calls` delta list into ``buf`` keyed by index.
+
+    Mutates ``buf`` in place. Safe to call with a ``None`` or empty deltas list.
+    """
+    if not deltas:
+        return
+    for d in deltas:
+        idx = d.get("index", 0)
+        slot = buf.setdefault(
+            idx, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+        )
+        if d.get("id"):
+            slot["id"] = d["id"]
+        if d.get("type"):
+            slot["type"] = d["type"]
+        fn = d.get("function") or {}
+        if fn.get("name"):
+            slot["function"]["name"] = fn["name"]
+        if fn.get("arguments"):
+            slot["function"]["arguments"] += fn["arguments"]
+
+
+def finalize_chat_tool_calls(
+    buf: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the buffered tool calls sorted by index, in /v1/chat shape."""
+    return [buf[k] for k in sorted(buf)]

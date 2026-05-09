@@ -22,6 +22,7 @@ from . import _config
 # Auto-load .env once on import (opt-out via ENCODE_DISABLE_DOTENV=1).
 _config.load_dotenv_once()
 
+from ._streaming import StreamEvent
 from ._version import __version__
 from .client import AsyncClient, Client
 from .errors import (
@@ -77,6 +78,7 @@ __all__ = [
     "RelayHandle",
     "AsyncRelayHandle",
     "InterceptEvent",
+    "StreamEvent",
     "whisper",
     "whisper_async",
     "Message",
