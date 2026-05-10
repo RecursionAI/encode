@@ -47,6 +47,17 @@ def parse_body(resp: httpx.Response) -> Any:
 def raise_for_status(resp: httpx.Response) -> None:
     if resp.is_success:
         return
+    # Idempotent for already-buffered responses; required for sync streaming.
+    resp.read()
+    body = parse_body(resp)
+    raise errors.from_envelope(body, status=resp.status_code)
+
+
+async def araise_for_status(resp: httpx.Response) -> None:
+    if resp.is_success:
+        return
+    # Required for responses obtained via async_client.stream(...).
+    await resp.aread()
     body = parse_body(resp)
     raise errors.from_envelope(body, status=resp.status_code)
 

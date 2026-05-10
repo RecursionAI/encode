@@ -1442,7 +1442,7 @@ async def _stream_chat_async(
         async with client._http.stream(
             "POST", "/v1/chat/completions", json=payload
         ) as resp:
-            _http.raise_for_status(resp)
+            await _http.araise_for_status(resp)
             async for ev in aiter_chat_completions(resp):
                 last_chunk = ev.raw
                 if ev.type == "content.delta":
@@ -1616,7 +1616,7 @@ async def _stream_responses_async(
         async with client._http.stream(
             "POST", "/v1/responses", json=payload
         ) as resp:
-            _http.raise_for_status(resp)
+            await _http.araise_for_status(resp)
             async for ev in aiter_responses(resp):
                 if ev.type == "response.output_text.delta":
                     delta = (ev.data or {}).get("delta", "")

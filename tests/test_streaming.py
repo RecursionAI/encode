@@ -270,3 +270,69 @@ def test_responses_stream_with_tools_two_iterations(respx_mock, base_url):
     assert "content.delta" in types
     text = "".join(e.data for e in events if e.type == "content.delta")
     assert text == "It's 72F."
+
+
+# ---------------------------------------------------------------------------
+# Streaming + error envelope (regression: httpx.ResponseNotRead)
+# ---------------------------------------------------------------------------
+
+
+_AUTH_ENVELOPE = {"error": {"message": "bad key", "type": "auth_error"}}
+
+
+def test_stream_chat_sync_error_status_parses_envelope(respx_mock, base_url):
+    respx_mock.post(f"{base_url}/v1/chat/completions").mock(
+        return_value=httpx.Response(401, json=_AUTH_ENVELOPE)
+    )
+    handle = encode.relay(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    with pytest.raises(encode.errors.AuthError):
+        list(handle)
+
+
+def test_stream_responses_sync_error_status_parses_envelope(respx_mock, base_url):
+    respx_mock.post(f"{base_url}/v1/responses").mock(
+        return_value=httpx.Response(401, json=_AUTH_ENVELOPE)
+    )
+    handle = encode.relay(
+        model="m",
+        input="hi",
+        stream=True,
+        endpoint="responses",
+    )
+    with pytest.raises(encode.errors.AuthError):
+        list(handle)
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_async_error_status_parses_envelope(respx_mock, base_url):
+    respx_mock.post(f"{base_url}/v1/chat/completions").mock(
+        return_value=httpx.Response(401, json=_AUTH_ENVELOPE)
+    )
+    handle = encode.relay_async(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    with pytest.raises(encode.errors.AuthError):
+        async for _ in handle:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_async_error_status_parses_envelope(respx_mock, base_url):
+    respx_mock.post(f"{base_url}/v1/responses").mock(
+        return_value=httpx.Response(401, json=_AUTH_ENVELOPE)
+    )
+    handle = encode.relay_async(
+        model="m",
+        input="hi",
+        stream=True,
+        endpoint="responses",
+    )
+    with pytest.raises(encode.errors.AuthError):
+        async for _ in handle:
+            pass
