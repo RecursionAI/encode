@@ -32,6 +32,7 @@ class EventType:
     ASSISTANT_MESSAGE = "assistant.message"
     TOOL_CALL = "tool.call"
     TOOL_RESULT = "tool.result"
+    TOOL_REGISTERED = "tool.registered"
     ITERATION_END = "iteration.end"
     CONTEXT_MODIFY = "context.modify"
     SYSTEM = "system"
@@ -52,6 +53,7 @@ class Event(BaseModel):
     - ``tool.call``         : ``{"id": str, "name": str, "arguments": dict, "iteration": int}``
     - ``tool.result``       : ``{"id": str, "result": Any, "result_serialized": str,
                                   "error": str | None, "duration_ms": float}``
+    - ``tool.registered``   : ``{"name": str, "schema": dict, "by": str}``
     - ``iteration.end``     : ``{"iteration": int, "had_tool_calls": bool,
                                   "finish_reason": str | None}``
     - ``context.modify``    : ``{"by": str, "summary": str, ...}``
@@ -125,6 +127,19 @@ class Event(BaseModel):
                 "error": error,
                 "duration_ms": duration_ms,
             },
+        )
+
+    @classmethod
+    def tool_registered(
+        cls,
+        *,
+        name: str,
+        schema: dict[str, Any],
+        by: str = "user",
+    ) -> Event:
+        return cls(
+            type=EventType.TOOL_REGISTERED,
+            data={"name": name, "schema": dict(schema), "by": by},
         )
 
     @classmethod

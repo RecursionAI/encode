@@ -87,18 +87,32 @@ RelayHandle.execute()            # run, return RelayResponse
 RelayHandle.response             # property: run + memoize
 iter(RelayHandle)                # stream events
 
+# Intercept (mutable mid-loop)
+event.append/.insert/.replace/.compact/.edit_last_tool_result   # mutate messages
+event.stop()                                                     # halt the loop
+event.register_tool(fn_or_dict)                                  # session-required
+
 AsyncRelayHandle.intercept(cb)
 await AsyncRelayHandle           # awaitable directly
 await AsyncRelayHandle.execute()
 async for event in AsyncRelayHandle: ...
 
 # Sessions (durable event log)
-encode.Session.open(id=None, metadata=None)
+encode.Session.open(id=None, metadata=None, tools=None)
+encode.Session.resume(data, tools=())     # model_validate + rebind_tools
 encode.AsyncSession.open(...)
+encode.AsyncSession.resume(data, tools=())
+# Per-session tool registry (append-only, idempotent by name)
+session.tools                              # list[Any], excluded from model_dump
+session.register_tool(fn_or_dict)          # returns True if newly added
+session.register_tools([...])              # bulk, returns count newly added
+session.rebind_tools([...])                # returns list[str] of unmatched names
 encode.Event              # factory classmethods: user_message, assistant_message,
-                          # tool_call, tool_result, iteration_end, system, custom, ...
+                          # tool_call, tool_result, tool_registered, iteration_end,
+                          # system, custom, ...
 encode.EventType          # USER_MESSAGE, ASSISTANT_MESSAGE, TOOL_CALL, TOOL_RESULT,
-                          # ITERATION_END, CONTEXT_MODIFY, SYSTEM, CUSTOM
+                          # TOOL_REGISTERED, ITERATION_END, CONTEXT_MODIFY, SYSTEM,
+                          # CUSTOM
 
 # Executors (the brain↔hands seam)
 encode.ToolExecutor                       # Protocol

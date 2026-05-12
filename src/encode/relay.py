@@ -70,8 +70,18 @@ class InterceptEvent:
     raw_response: dict[str, Any]
     will_continue: bool
     messages: Messages = field(default_factory=Messages)
+    _session: Session | None = field(default=None, repr=False)
     _initial_snapshot: list[dict[str, Any]] = field(default_factory=list, repr=False)
     _stopped: bool = field(default=False, repr=False)
+
+    @property
+    def session(self) -> Session | None:
+        """The Session attached to this run, or ``None`` if running stateless.
+
+        Read-only handle to the durable event log; mutate via verbs like
+        ``register_tool`` rather than poking the events list directly.
+        """
+        return self._session
 
     def __post_init__(self) -> None:
         # Capture starting state for mutation detection. Use deep-enough copies
@@ -145,6 +155,27 @@ class InterceptEvent:
     @property
     def stopped(self) -> bool:
         return self._stopped
+
+    def register_tool(self, tool: Any) -> bool:
+        """Add a tool to the run's :class:`Session` for the next iteration.
+
+        Idempotent: same-name registrations are no-ops. For the new tool to
+        appear in the next iteration's request, the harness was started with
+        ``tools=session.tools`` (or any list that shares identity with the
+        session's tool list) — otherwise the tool is recorded in the durable
+        log but the model won't see it on the next turn.
+
+        Raises ``RuntimeError`` if the run has no session attached, since
+        tool registrations are an audit-log event.
+
+        Returns ``True`` if newly registered, ``False`` if a same-name tool
+        already exists on the session.
+        """
+        if self._session is None:
+            raise RuntimeError(
+                "register_tool requires session=... on the relay() call"
+            )
+        return self._session.register_tool(tool, by="intercept")
 
 
 # ---------------------------------------------------------------------------
@@ -603,18 +634,65 @@ def _hydrate_history(c: _RelayConfig) -> list[dict[str, Any]]:
     return history
 
 
-def _build_executor(c: _RelayConfig) -> tuple[ToolExecutor, list[dict[str, Any]]]:
-    """Return ``(executor, tool_dicts)`` for this call.
+@dataclass
+class _ToolBindings:
+    """Mutable holder for the per-call tool state.
 
-    ``tool_dicts`` is the schema list sent to the model; the executor is what
-    the harness calls to dispatch. When ``tool_executor=`` is supplied we use
-    it as-is and only build schemas from ``tools=``. Otherwise we build a
-    ``LocalToolExecutor`` from the same ``tools=`` argument.
+    The relay loop reads ``tool_dicts`` (sent to the model) and ``executor``
+    (dispatches calls). When ``c.tools`` is a list that grows mid-loop —
+    typically because it is ``session.tools`` and an intercept handler called
+    ``event.register_tool(...)`` — :func:`_refresh_tools` rebuilds these
+    on the next iteration so the new tool becomes visible.
+
+    ``local`` is the in-process executor we own, if any: when present, we
+    mutate its internal dispatch dict in place so its identity stays stable
+    across iterations. User-supplied executors are not mutated.
     """
+
+    tool_dicts: list[dict[str, Any]]
+    executor: ToolExecutor
+    local: LocalToolExecutor | None
+    last_len: int
+
+
+def _tools_len(c: _RelayConfig) -> int:
+    return len(c.tools) if c.tools is not None else 0
+
+
+def _make_bindings(c: _RelayConfig) -> _ToolBindings:
+    """Initial build of the tool dispatch + schema list."""
     tool_dicts, tool_index = tools.build_tools(c.tools, web_search=c.web_search)
     if c.tool_executor is not None:
-        return c.tool_executor, tool_dicts
-    return LocalToolExecutor(tool_index), tool_dicts
+        return _ToolBindings(
+            tool_dicts=tool_dicts,
+            executor=c.tool_executor,
+            local=None,
+            last_len=_tools_len(c),
+        )
+    local = LocalToolExecutor(tool_index)
+    return _ToolBindings(
+        tool_dicts=tool_dicts,
+        executor=local,
+        local=local,
+        last_len=_tools_len(c),
+    )
+
+
+def _refresh_tools(c: _RelayConfig, b: _ToolBindings) -> None:
+    """Rebuild ``b.tool_dicts`` (and ``b.local`` dispatch) if ``c.tools`` grew.
+
+    Append-only tool lists: a length change means new entries at the tail.
+    We rebuild from scratch (cheap for typical tool counts) and mutate the
+    in-process executor in place so iteration state stays consistent.
+    """
+    cur_len = _tools_len(c)
+    if cur_len == b.last_len:
+        return
+    tool_dicts, tool_index = tools.build_tools(c.tools, web_search=c.web_search)
+    b.tool_dicts = tool_dicts
+    if b.local is not None:
+        b.local._tools = tool_index
+    b.last_len = cur_len
 
 
 def _emit_assistant_event(
@@ -759,17 +837,17 @@ async def _fire_intercepts_async(
 def _execute_sync(
     client: Any, c: _RelayConfig, interceptors: list[InterceptCallback]
 ) -> RelayResponse:
-    executor, tool_dicts = _build_executor(c)
+    bindings = _make_bindings(c)
     response_format_payload, parser_model = _build_response_format(
         c.response_format, c.endpoint
     )
 
     if c.endpoint == "chat":
         return _loop_chat_sync(
-            client, c, interceptors, tool_dicts, executor, response_format_payload, parser_model
+            client, c, interceptors, bindings, response_format_payload, parser_model
         )
     return _loop_responses_sync(
-        client, c, interceptors, tool_dicts, executor, response_format_payload, parser_model
+        client, c, interceptors, bindings, response_format_payload, parser_model
     )
 
 
@@ -777,8 +855,7 @@ def _loop_chat_sync(
     client: Any,
     c: _RelayConfig,
     interceptors: list[InterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
     response_format_payload: Any,
     parser_model: type[BaseModel] | None,
 ) -> RelayResponse:
@@ -791,12 +868,13 @@ def _loop_chat_sync(
 
     for iteration in itertools.count():
         iterations = iteration + 1
-        stream_this_iter = c.stream and not tool_dicts
+        _refresh_tools(c, bindings)
+        stream_this_iter = c.stream and not bindings.tool_dicts
 
         payload = _build_chat_payload(
             model=c.model,
             messages=history,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=response_format_payload,
             stream=stream_this_iter,
             extra=_common_extras(c),
@@ -825,7 +903,7 @@ def _loop_chat_sync(
             _emit_tool_call_event(
                 c, id=tc_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = executor.execute(fn_name, args)
+            exec_result = bindings.executor.execute(fn_name, args)
             serialized = exec_result.result_serialized
             history.append(
                 {"role": "tool", "tool_call_id": tc_id, "content": serialized}
@@ -861,6 +939,7 @@ def _loop_chat_sync(
             messages=Messages(history),
             raw_response=resp_body,
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = _fire_intercepts_sync(interceptors, event)
         new_history = _read_back_intercept(event, c)
@@ -908,8 +987,7 @@ def _loop_responses_sync(
     client: Any,
     c: _RelayConfig,
     interceptors: list[InterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
     response_format_payload: Any,
     parser_model: type[BaseModel] | None,
 ) -> RelayResponse:
@@ -928,12 +1006,13 @@ def _loop_responses_sync(
 
     for iteration in itertools.count():
         iterations = iteration + 1
-        stream_this_iter = c.stream and not tool_dicts
+        _refresh_tools(c, bindings)
+        stream_this_iter = c.stream and not bindings.tool_dicts
 
         payload = _build_responses_payload(
             model=c.model,
             input_items=input_items,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=response_format_payload,
             stream=stream_this_iter,
             extra=_common_extras(c),
@@ -965,7 +1044,7 @@ def _loop_responses_sync(
             _emit_tool_call_event(
                 c, id=call_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = executor.execute(fn_name, args)
+            exec_result = bindings.executor.execute(fn_name, args)
             serialized = exec_result.result_serialized
             input_items.append(
                 {
@@ -1008,6 +1087,7 @@ def _loop_responses_sync(
             messages=Messages(history),
             raw_response=resp_body,
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = _fire_intercepts_sync(interceptors, event)
         new_history = _read_back_intercept(event, c)
@@ -1060,17 +1140,17 @@ def _loop_responses_sync(
 async def _execute_async(
     client: Any, c: _RelayConfig, interceptors: list[AsyncInterceptCallback]
 ) -> RelayResponse:
-    executor, tool_dicts = _build_executor(c)
+    bindings = _make_bindings(c)
     response_format_payload, parser_model = _build_response_format(
         c.response_format, c.endpoint
     )
 
     if c.endpoint == "chat":
         return await _loop_chat_async(
-            client, c, interceptors, tool_dicts, executor, response_format_payload, parser_model
+            client, c, interceptors, bindings, response_format_payload, parser_model
         )
     return await _loop_responses_async(
-        client, c, interceptors, tool_dicts, executor, response_format_payload, parser_model
+        client, c, interceptors, bindings, response_format_payload, parser_model
     )
 
 
@@ -1078,8 +1158,7 @@ async def _loop_chat_async(
     client: Any,
     c: _RelayConfig,
     interceptors: list[AsyncInterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
     response_format_payload: Any,
     parser_model: type[BaseModel] | None,
 ) -> RelayResponse:
@@ -1092,11 +1171,12 @@ async def _loop_chat_async(
 
     for iteration in itertools.count():
         iterations = iteration + 1
-        stream_this_iter = c.stream and not tool_dicts
+        _refresh_tools(c, bindings)
+        stream_this_iter = c.stream and not bindings.tool_dicts
         payload = _build_chat_payload(
             model=c.model,
             messages=history,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=response_format_payload,
             stream=stream_this_iter,
             extra=_common_extras(c),
@@ -1125,7 +1205,7 @@ async def _loop_chat_async(
             _emit_tool_call_event(
                 c, id=tc_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = await executor.execute_async(fn_name, args)
+            exec_result = await bindings.executor.execute_async(fn_name, args)
             serialized = exec_result.result_serialized
             history.append(
                 {"role": "tool", "tool_call_id": tc_id, "content": serialized}
@@ -1161,6 +1241,7 @@ async def _loop_chat_async(
             messages=Messages(history),
             raw_response=resp_body,
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = await _fire_intercepts_async(interceptors, event)
         new_history = _read_back_intercept(event, c)
@@ -1208,8 +1289,7 @@ async def _loop_responses_async(
     client: Any,
     c: _RelayConfig,
     interceptors: list[AsyncInterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
     response_format_payload: Any,
     parser_model: type[BaseModel] | None,
 ) -> RelayResponse:
@@ -1228,11 +1308,12 @@ async def _loop_responses_async(
 
     for iteration in itertools.count():
         iterations = iteration + 1
-        stream_this_iter = c.stream and not tool_dicts
+        _refresh_tools(c, bindings)
+        stream_this_iter = c.stream and not bindings.tool_dicts
         payload = _build_responses_payload(
             model=c.model,
             input_items=input_items,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=response_format_payload,
             stream=stream_this_iter,
             extra=_common_extras(c),
@@ -1264,7 +1345,7 @@ async def _loop_responses_async(
             _emit_tool_call_event(
                 c, id=call_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = await executor.execute_async(fn_name, args)
+            exec_result = await bindings.executor.execute_async(fn_name, args)
             serialized = exec_result.result_serialized
             input_items.append(
                 {
@@ -1307,6 +1388,7 @@ async def _loop_responses_async(
             messages=Messages(history),
             raw_response=resp_body,
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = await _fire_intercepts_async(interceptors, event)
         new_history = _read_back_intercept(event, c)
@@ -1364,19 +1446,18 @@ async def _loop_responses_async(
 def _execute_sync_stream(
     client: Any, c: _RelayConfig, interceptors: list[InterceptCallback]
 ) -> Iterator[StreamEvent]:
-    executor, tool_dicts = _build_executor(c)
+    bindings = _make_bindings(c)
     if c.endpoint == "chat":
-        yield from _stream_chat_sync(client, c, interceptors, tool_dicts, executor)
+        yield from _stream_chat_sync(client, c, interceptors, bindings)
     else:
-        yield from _stream_responses_sync(client, c, interceptors, tool_dicts, executor)
+        yield from _stream_responses_sync(client, c, interceptors, bindings)
 
 
 def _stream_chat_sync(
     client: Any,
     c: _RelayConfig,
     interceptors: list[InterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
 ) -> Iterator[StreamEvent]:
     history: list[dict[str, Any]] = _hydrate_history(c)
     all_tool_calls: list[ToolCallRecord] = []
@@ -1387,10 +1468,11 @@ def _stream_chat_sync(
 
     for iteration in itertools.count():
         iterations = iteration + 1
+        _refresh_tools(c, bindings)
         payload = _build_chat_payload(
             model=c.model,
             messages=history,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=None,
             stream=True,
             extra=_common_extras(c),
@@ -1454,7 +1536,7 @@ def _stream_chat_sync(
             _emit_tool_call_event(
                 c, id=tc_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = executor.execute(fn_name, args)
+            exec_result = bindings.executor.execute(fn_name, args)
             serialized = exec_result.result_serialized
             if exec_result.error is None:
                 yield StreamEvent(
@@ -1508,6 +1590,7 @@ def _stream_chat_sync(
             messages=Messages(history),
             raw_response=last_chunk if isinstance(last_chunk, dict) else {},
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = _fire_intercepts_sync(interceptors, intercept)
         new_history = _read_back_intercept(intercept, c)
@@ -1560,8 +1643,7 @@ def _stream_responses_sync(
     client: Any,
     c: _RelayConfig,
     interceptors: list[InterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
 ) -> Iterator[StreamEvent]:
     if c.session is not None:
         history: list[dict[str, Any]] = _hydrate_history(c)
@@ -1578,10 +1660,11 @@ def _stream_responses_sync(
 
     for iteration in itertools.count():
         iterations = iteration + 1
+        _refresh_tools(c, bindings)
         payload = _build_responses_payload(
             model=c.model,
             input_items=input_items,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=None,
             stream=True,
             extra=_common_extras(c),
@@ -1641,7 +1724,7 @@ def _stream_responses_sync(
             _emit_tool_call_event(
                 c, id=call_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = executor.execute(fn_name, args)
+            exec_result = bindings.executor.execute(fn_name, args)
             serialized = exec_result.result_serialized
             if exec_result.error is None:
                 yield StreamEvent(
@@ -1702,6 +1785,7 @@ def _stream_responses_sync(
             messages=Messages(history),
             raw_response=completed_response if isinstance(completed_response, dict) else {},
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = _fire_intercepts_sync(interceptors, intercept)
         new_history = _read_back_intercept(intercept, c)
@@ -1754,16 +1838,12 @@ def _stream_responses_sync(
 async def _execute_async_stream(
     client: Any, c: _RelayConfig, interceptors: list[AsyncInterceptCallback]
 ) -> AsyncIterator[StreamEvent]:
-    executor, tool_dicts = _build_executor(c)
+    bindings = _make_bindings(c)
     if c.endpoint == "chat":
-        async for ev in _stream_chat_async(
-            client, c, interceptors, tool_dicts, executor
-        ):
+        async for ev in _stream_chat_async(client, c, interceptors, bindings):
             yield ev
     else:
-        async for ev in _stream_responses_async(
-            client, c, interceptors, tool_dicts, executor
-        ):
+        async for ev in _stream_responses_async(client, c, interceptors, bindings):
             yield ev
 
 
@@ -1771,8 +1851,7 @@ async def _stream_chat_async(
     client: Any,
     c: _RelayConfig,
     interceptors: list[AsyncInterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
 ) -> AsyncIterator[StreamEvent]:
     history: list[dict[str, Any]] = _hydrate_history(c)
     all_tool_calls: list[ToolCallRecord] = []
@@ -1783,10 +1862,11 @@ async def _stream_chat_async(
 
     for iteration in itertools.count():
         iterations = iteration + 1
+        _refresh_tools(c, bindings)
         payload = _build_chat_payload(
             model=c.model,
             messages=history,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=None,
             stream=True,
             extra=_common_extras(c),
@@ -1850,7 +1930,7 @@ async def _stream_chat_async(
             _emit_tool_call_event(
                 c, id=tc_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = await executor.execute_async(fn_name, args)
+            exec_result = await bindings.executor.execute_async(fn_name, args)
             serialized = exec_result.result_serialized
             if exec_result.error is None:
                 yield StreamEvent(
@@ -1904,6 +1984,7 @@ async def _stream_chat_async(
             messages=Messages(history),
             raw_response=last_chunk if isinstance(last_chunk, dict) else {},
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = await _fire_intercepts_async(interceptors, intercept)
         new_history = _read_back_intercept(intercept, c)
@@ -1956,8 +2037,7 @@ async def _stream_responses_async(
     client: Any,
     c: _RelayConfig,
     interceptors: list[AsyncInterceptCallback],
-    tool_dicts: list[dict[str, Any]],
-    executor: ToolExecutor,
+    bindings: _ToolBindings,
 ) -> AsyncIterator[StreamEvent]:
     if c.session is not None:
         history: list[dict[str, Any]] = _hydrate_history(c)
@@ -1974,10 +2054,11 @@ async def _stream_responses_async(
 
     for iteration in itertools.count():
         iterations = iteration + 1
+        _refresh_tools(c, bindings)
         payload = _build_responses_payload(
             model=c.model,
             input_items=input_items,
-            tool_dicts=tool_dicts or None,
+            tool_dicts=bindings.tool_dicts or None,
             response_format=None,
             stream=True,
             extra=_common_extras(c),
@@ -2037,7 +2118,7 @@ async def _stream_responses_async(
             _emit_tool_call_event(
                 c, id=call_id, name=fn_name, arguments=args, iteration=iteration
             )
-            exec_result = await executor.execute_async(fn_name, args)
+            exec_result = await bindings.executor.execute_async(fn_name, args)
             serialized = exec_result.result_serialized
             if exec_result.error is None:
                 yield StreamEvent(
@@ -2098,6 +2179,7 @@ async def _stream_responses_async(
             messages=Messages(history),
             raw_response=completed_response if isinstance(completed_response, dict) else {},
             will_continue=will_continue,
+            _session=c.session,
         )
         stopped = await _fire_intercepts_async(interceptors, intercept)
         new_history = _read_back_intercept(intercept, c)

@@ -173,9 +173,23 @@ def with_objects(q: str) -> dict:          # default=str handles datetimes etc.
     return {"created_at": datetime.now(), "rows": 3}
 ```
 
+## Tools that live on a Session
+
+Tools can also be stored on a `Session` — pass `tools=session.tools` to `relay()` and an intercept handler can append new tools mid-loop (auto-discovery). The session keeps an append-only `tool.registered` audit log. Idempotent: same-name registrations are no-ops.
+
+```python
+session = encode.Session.open(tools=[search])
+session.register_tool(fetch)                   # appends + emits tool.registered
+
+encode.relay(model="m", messages=[...], session=session, tools=session.tools).response
+```
+
+See [sessions.md → Session-owned tools](./sessions.md#session-owned-tools) and [intercept.md → Auto tool discovery](./intercept.md#auto-tool-discovery--eventregister_toolfn).
+
 ## See also
 
 - [intercept.md](./intercept.md) — observe / mutate between iterations
+- [sessions.md](./sessions.md) — session-owned tool registry
 - [executors.md](./executors.md) — swap dispatch (remote, MCP, sub-agent)
 - [terminal.md](./terminal.md) — the canonical stateful tool pattern
 - [errors.md](./errors.md) — `MaxToolIterationsError`, `InvalidToolCallError`

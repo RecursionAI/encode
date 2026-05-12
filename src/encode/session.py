@@ -25,6 +25,7 @@ processes.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -70,6 +71,11 @@ class Session(BaseModel):
     updated_at: datetime = Field(default_factory=_now)
     events: list[Event] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Runtime-only tool registry. Excluded from model_dump because Python
+    # callables aren't JSON-serializable; the durable record lives in the
+    # ``tool.registered`` events. Use ``register_tool`` / ``rebind_tools`` /
+    # ``Session.resume(data, tools=...)`` to manage this list.
+    tools: list[Any] = Field(default_factory=list, exclude=True)
 
     # ------------------------- write (append-only) -------------------------
 
@@ -94,6 +100,71 @@ class Session(BaseModel):
         self.events.append(ev)
         self.updated_at = ev.ts
         return ev
+
+    # ------------------------- tool registry (append-only) -------------------------
+
+    def register_tool(self, tool: Any, *, by: str = "user") -> bool:
+        """Register a tool on the session. Append-only and idempotent.
+
+        Adds ``tool`` to ``self.tools`` and emits a ``tool.registered`` event
+        carrying the model-facing schema. If a tool with the same name is
+        already registered, the call is a no-op and returns ``False``.
+
+        ``by`` records the origin of the registration in the event payload
+        (``"user"``, ``"intercept"``, ``"resume"``, or any custom string).
+
+        Returns ``True`` if newly registered, ``False`` if skipped.
+        """
+        from . import tools as _tools
+
+        name = _tools.tool_name(tool)
+        if not name:
+            raise ValueError(
+                "could not determine a name for the tool — pass a callable with __name__ or a dict with function.name / name"
+            )
+        for existing in self.tools:
+            if _tools.tool_name(existing) == name:
+                return False
+        schema = _tools.tool_schema(tool)
+        self.tools.append(tool)
+        self.emit(EventType.TOOL_REGISTERED, {"name": name, "schema": schema, "by": by})
+        return True
+
+    def register_tools(self, tools: Iterable[Any], *, by: str = "user") -> int:
+        """Bulk-register an iterable of tools. Returns the count newly added."""
+        return sum(1 for t in tools if self.register_tool(t, by=by))
+
+    def rebind_tools(self, tools: Iterable[Any]) -> list[str]:
+        """Re-register callables matching ``tool.registered`` events in the log.
+
+        Walks the log in order; for each unique registered name, looks up a
+        callable in ``tools`` (matched via ``tool_name``) and registers it with
+        ``by="resume"``. Idempotent — calling ``rebind_tools`` again on a
+        session that's already bound is safe (same-name registrations skip).
+
+        Returns the list of names from the event log that had no matching
+        callable supplied — useful for surfacing missing bindings on resume.
+        """
+        from . import tools as _tools
+
+        supplied: dict[str, Any] = {}
+        for t in tools:
+            name = _tools.tool_name(t)
+            if name:
+                supplied.setdefault(name, t)
+
+        seen: set[str] = set()
+        missing: list[str] = []
+        for ev in self.events_by_type(EventType.TOOL_REGISTERED):
+            name = str(ev.data.get("name") or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if name in supplied:
+                self.register_tool(supplied[name], by="resume")
+            else:
+                missing.append(name)
+        return missing
 
     # ------------------------- read -------------------------
 
@@ -153,12 +224,38 @@ class Session(BaseModel):
         id: str | None = None,
         *,
         metadata: dict[str, Any] | None = None,
+        tools: Iterable[Any] | None = None,
     ) -> Session:
-        """Start a fresh session with a generated (or provided) id."""
-        return cls(
+        """Start a fresh session with a generated (or provided) id.
+
+        If ``tools`` is provided, each one is registered (and a
+        ``tool.registered`` event is emitted) before the session is returned.
+        """
+        sess = cls(
             id=id if id is not None else _new_session_id(),
             metadata=dict(metadata) if metadata else {},
         )
+        if tools:
+            sess.register_tools(tools)
+        return sess
+
+    @classmethod
+    def resume(
+        cls,
+        data: dict[str, Any],
+        *,
+        tools: Iterable[Any] = (),
+    ) -> Session:
+        """Round-trip helper: ``model_validate(data)`` + ``rebind_tools(tools)``.
+
+        Convenience for restoring a session from a persisted dump and
+        re-binding callables to the names captured in the event log. Names
+        that have no matching callable in ``tools`` are silently skipped — use
+        :meth:`rebind_tools` directly if you need the list of missing names.
+        """
+        sess = cls.model_validate(data)
+        sess.rebind_tools(tools)
+        return sess
 
 
 class AsyncSession(Session):
@@ -173,6 +270,17 @@ class AsyncSession(Session):
         self, type: str | Event, data: dict[str, Any] | None = None
     ) -> Event:
         return self.emit(type, data)
+
+    async def aregister_tool(self, tool: Any, *, by: str = "user") -> bool:
+        return self.register_tool(tool, by=by)
+
+    async def aregister_tools(
+        self, tools: Iterable[Any], *, by: str = "user"
+    ) -> int:
+        return self.register_tools(tools, by=by)
+
+    async def arebind_tools(self, tools: Iterable[Any]) -> list[str]:
+        return self.rebind_tools(tools)
 
 
 __all__ = [

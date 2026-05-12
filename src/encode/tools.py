@@ -18,6 +18,37 @@ from . import errors
 from ._schema import callable_to_tool_dict
 
 
+def tool_name(tool: Any) -> str:
+    """Extract the registered name for a tool entry.
+
+    Accepts a Python callable (uses ``__name__``) or a raw tool dict in either
+    OpenAI's wrapped form (``{"type": "function", "function": {"name": ...}}``)
+    or a flat ``{"name": ...}`` shape. Returns ``""`` if no name can be found.
+    """
+    if callable(tool) and not isinstance(tool, dict):
+        return getattr(tool, "__name__", "") or ""
+    if isinstance(tool, dict):
+        fn = tool.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            return str(fn["name"])
+        if tool.get("name"):
+            return str(tool["name"])
+    return ""
+
+
+def tool_schema(tool: Any) -> dict[str, Any]:
+    """Return the model-facing tool schema for a single tool entry.
+
+    For callables, introspects the signature via :func:`callable_to_tool_dict`.
+    For dicts, returns a shallow copy.
+    """
+    if callable(tool) and not isinstance(tool, dict):
+        return callable_to_tool_dict(tool)
+    if isinstance(tool, dict):
+        return dict(tool)
+    raise TypeError(f"unsupported tool type: {type(tool).__name__}")
+
+
 def build_tools(
     tools: Sequence[Callable[..., Any] | dict[str, Any]] | None,
     *,
@@ -29,11 +60,11 @@ def build_tools(
     if tools:
         for t in tools:
             if callable(t) and not isinstance(t, dict):
-                d = callable_to_tool_dict(t)
+                d = tool_schema(t)
                 tool_dicts.append(d)
                 tool_index[d["function"]["name"]] = t
             else:
-                td = dict(t)
+                td = tool_schema(t)
                 tool_dicts.append(td)
                 # raw dict tools have no callable; nothing to register
 

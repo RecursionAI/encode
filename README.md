@@ -123,6 +123,21 @@ def trim(event):
 encode.relay(..., tools=[noisy_tool], on_intercept=trim).response
 ```
 
+**Auto tool discovery** — the model calls a `list_tools` bootstrap, an intercept registers the discovered tools on the session, the next iteration uses them.
+
+```python
+session = encode.Session.open(tools=[list_tools])
+
+def discover(event):
+    for tc in event.tool_calls:
+        if tc.name == "list_tools":
+            for spec in tc.result or []:
+                event.register_tool(IMPLS[spec["function"]["name"]])
+
+encode.relay(model="m", messages=[...], session=session,
+             tools=session.tools, on_intercept=discover).response
+```
+
 **A bash sandbox tool.**
 
 ```python

@@ -67,6 +67,7 @@ Standard types (`EventType.*`):
 | `ASSISTANT_MESSAGE` | `assistant.message` | `{"content": str | None, "tool_calls": [...] | None}`     |
 | `TOOL_CALL`         | `tool.call`      | `{"id": str, "name": str, "arguments": dict, "iteration": int}` |
 | `TOOL_RESULT`       | `tool.result`    | `{"id": str, "result": Any, "result_serialized": str, "error": str | None, "duration_ms": float}` |
+| `TOOL_REGISTERED`   | `tool.registered` | `{"name": str, "schema": dict, "by": str}` (emitted by `register_tool` / `Session.open(tools=...)` / `rebind_tools`) |
 | `ITERATION_END`     | `iteration.end`  | `{"iteration": int, "had_tool_calls": bool, "finish_reason": str | None}` |
 | `CONTEXT_MODIFY`    | `context.modify` | `{"by": str, "summary": str, ...}` (emitted by Intercept mutations) |
 | `SYSTEM`            | `system`         | `{"content": str}`                                           |
@@ -199,6 +200,76 @@ Recommended patterns:
 
 - **Single writer**: one process owns the in-memory `Session`; persist after each `relay()` call.
 - **Atomic append at the DB layer**: write events one at a time (e.g. `INSERT` with serial id from a sequence) and rehydrate before each `relay()`.
+
+## Session-owned tools
+
+A Session can also own an **append-only tool registry** — pass `tools=session.tools` to `relay()` and you can grow the registry mid-loop (typically from an intercept callback) so a single agent run can discover and start using new tools without re-launching.
+
+```python
+def search(query: str) -> dict:
+    """Search the index."""
+    return ...
+
+def list_tools() -> list[dict]:
+    """Discover available tools."""
+    return [...]   # tool schemas as raw dicts
+
+session = encode.Session.open(tools=[search, list_tools])
+
+encode.relay(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "discover, then use what you find"}],
+    session=session,
+    tools=session.tools,        # ← the live registry
+    on_intercept=lambda ev: [ev.register_tool(s) for tc in ev.tool_calls
+                             if tc.name == "list_tools" for s in (tc.result or [])],
+).response
+```
+
+API:
+
+```python
+session.register_tool(fn_or_dict)           # idempotent: same name → no-op, returns False
+session.register_tools([fn1, fn2, ...])     # bulk, returns count newly added
+session.tools                               # list[Any] — the live registry
+```
+
+Each `register_tool` call emits a `tool.registered` event into the durable log; the `by` field records the origin (`"user"`, `"intercept"`, `"resume"`).
+
+### How auto-discovery flows through the loop
+
+The relay loop re-reads `tools=` at the top of each iteration. When it's the same list reference as `session.tools`, additions made during an intercept callback show up on the **next** iteration's request to the model. The in-process executor's dispatch table is also rebuilt automatically — your registered callable is callable next turn.
+
+If you pass a different list as `tools=` (i.e. not `session.tools`), `event.register_tool(...)` still appends to the session and emits the audit-log event, but the new tool won't appear in the model's next request — pass `tools=session.tools` to opt in.
+
+### Idempotency
+
+Same-name registrations are silently skipped. This makes auto-discovery loops safe to re-trigger: if the model calls `list_tools` twice and returns overlapping specs, only the new names are registered. Both `register_tool(fn)` and `register_tools([...])` return how many entries were *newly* added.
+
+### Resuming with tools
+
+`session.model_dump()` does **not** include the live `tools` list — Python callables aren't JSON-serializable. The `tool.registered` events are part of the log, though, so they survive the round-trip. Use `rebind_tools` (or the `Session.resume` convenience class method) to bind your callables back to the session on the other side:
+
+```python
+# round-trip — anything that survives JSON works
+raw = json.dumps(session.model_dump(), default=str)
+
+# Method 1: one-liner via Session.resume
+session = encode.Session.resume(json.loads(raw), tools=[search, list_tools])
+
+# Method 2: split into validate + rebind
+session = encode.Session.model_validate(json.loads(raw))
+missing = session.rebind_tools([search, list_tools])
+if missing:
+    print(f"missing callables for: {missing}")   # names from the log without a binding
+
+# Continue the run
+encode.relay(model="m", messages=[...], session=session, tools=session.tools).response
+```
+
+`rebind_tools` walks `tool.registered` events in order, matches each name against the callables you supplied (by `__name__` for functions, `function.name` / `name` for dicts), and registers them with `by="resume"`. It's idempotent: calling it twice on the same session is safe.
+
+Async parity: `aregister_tool` / `aregister_tools` / `arebind_tools` on `AsyncSession`, and `AsyncSession.resume`.
 
 ## Custom events
 

@@ -310,6 +310,60 @@ for w in out.words or []:
 
 ---
 
+## Auto tool discovery — `list_tools` + intercept
+
+Single bootstrap tool, intercept appends discovered tools, the model uses them on the next turn — no restarts.
+
+```python
+import encode
+
+def list_tools() -> list[dict]:
+    """Discover available tools."""
+    return [
+        {"type": "function", "function": {
+            "name": "fetch",
+            "description": "Fetch a URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        }},
+    ]
+
+def fetch(url: str) -> dict:
+    """Fetch a URL."""
+    return {"url": url, "status": 200}
+
+IMPLS = {"fetch": fetch}
+
+def discover(event):
+    for tc in event.tool_calls:
+        if tc.name == "list_tools":
+            for spec in tc.result or []:
+                name = spec["function"]["name"]
+                if name in IMPLS:
+                    event.register_tool(IMPLS[name])
+
+session = encode.Session.open(tools=[list_tools])
+out = encode.relay(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "Discover tools, then fetch example.com."}],
+    session=session,
+    tools=session.tools,
+    on_intercept=discover,
+    max_tool_iterations=10,
+).response
+
+print(out.content)
+print("registered:", [ev.data["name"] for ev in session.events_by_type("tool.registered")])
+```
+
+Source: [`examples/tool_discovery.py`](../examples/tool_discovery.py) — [sessions.md](./sessions.md#session-owned-tools), [intercept.md](./intercept.md#auto-tool-discovery--eventregister_toolfn)
+
+---
+
 ## Branching conversations
 
 ```python

@@ -176,6 +176,53 @@ await encode.relay_async(...).intercept(cb)
 
 Async callbacks can still call the sync mutation helpers — they operate on the in-memory `Messages` view.
 
+## Auto tool discovery — `event.register_tool(fn)`
+
+When `session=` is attached to the run, the intercept callback can register a new tool on the session's append-only registry, and the **next** iteration of the loop will see it. This unlocks a clean auto-discovery pattern: the model calls a bootstrap `list_tools` function, the intercept reads the result, and the model proceeds to call the freshly registered tools without restarting the run.
+
+```python
+def list_tools() -> list[dict]:
+    """Discover available tools."""
+    return [
+        {"type": "function", "function": {"name": "fetch", "description": "...",
+         "parameters": {...}}},
+    ]
+
+def fetch(url: str) -> dict:
+    """Fetch a URL."""
+    ...
+
+IMPLS = {"fetch": fetch}
+
+def discover(event):
+    for tc in event.tool_calls:
+        if tc.name != "list_tools":
+            continue
+        for spec in tc.result or []:
+            name = spec["function"]["name"]
+            if name in IMPLS:
+                event.register_tool(IMPLS[name])    # binds callable for dispatch
+
+session = encode.Session.open(tools=[list_tools])
+encode.relay(
+    model="gpt-4o-mini",
+    messages=[{"role": "user", "content": "discover, then use what you find"}],
+    session=session,
+    tools=session.tools,                # ← live registry
+    on_intercept=discover,
+).response
+```
+
+Rules:
+
+- `event.register_tool(tool)` requires the run to have a `session=`. Otherwise it raises.
+- Idempotent: a same-name registration is a no-op. Returns `True` if newly registered, `False` if skipped.
+- Each registration emits a `tool.registered` event into the session log with `by="intercept"`.
+- For the new tool to appear in the model's next iteration, you must have passed `tools=session.tools` to `relay()` (so the relay loop is reading from the same list the intercept mutates).
+- Works on both the chat and responses endpoints, and across streaming + non-streaming.
+
+See [sessions.md → Session-owned tools](./sessions.md#session-owned-tools) for the registry API itself (`register_tool` / `register_tools` / `rebind_tools` / `Session.resume`).
+
 ## Cookbook — full agent + stop()
 
 ```python
