@@ -85,12 +85,12 @@ class MaxToolIterationsError(CourierError):
         self.partial = partial
 
 
-class SessionError(CourierError):
-    """Persistent shell session failure (spawn, dead process, unsupported platform)."""
+class TerminalError(CourierError):
+    """Persistent shell terminal failure (spawn, dead process, unsupported platform)."""
 
 
-class SessionTimeoutError(SessionError):
-    """A session command exceeded its timeout.
+class TerminalTimeoutError(TerminalError):
+    """A terminal command exceeded its timeout.
 
     Carries ``partial_output`` (whatever was emitted before the cutoff) and
     ``command`` so callers can salvage what happened.

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 from pydantic import BaseModel, ConfigDict
 
 if TYPE_CHECKING:
+    from .events import Event
     from .responses import RelayResponse
 
 
@@ -327,6 +328,63 @@ class Messages(Sequence[dict[str, Any]]):
         m = cls()
         for msg in model.messages:
             m._items.append(msg.model_dump(exclude_none=True))
+        return m
+
+    # ------------------------- session interop -------------------------
+
+    @classmethod
+    def from_events(cls, events: Iterable[Event]) -> Messages:
+        """Project a sequence of :class:`Event` records into a Messages list.
+
+        Standard projection:
+
+        - ``user.message``      → ``{"role": "user", "content": ...}``
+        - ``assistant.message`` → ``{"role": "assistant", "content": ..., "tool_calls": ...}``
+        - ``tool.result``       → ``{"role": "tool", "tool_call_id": id, "content": serialized}``
+        - ``system``            → ``{"role": "system", "content": ...}``
+
+        Other event types (``tool.call`` standalone, ``iteration.end``,
+        ``context.modify``, custom) are bookkeeping and are skipped — the
+        assistant turn already carries the ``tool_calls`` it issued.
+
+        Tool results without a preceding assistant tool_calls turn are still
+        projected (so partial sessions remain usable); they end up as orphan
+        tool messages.
+        """
+        m = cls()
+        for ev in events:
+            t = ev.type
+            d = ev.data or {}
+            if t == "user.message":
+                m._items.append(
+                    {"role": "user", "content": _coerce_content(d.get("content"))}
+                )
+            elif t == "assistant.message":
+                msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": d.get("content"),
+                }
+                tcs = d.get("tool_calls")
+                if tcs:
+                    msg["tool_calls"] = [dict(tc) for tc in tcs]
+                m._items.append(msg)
+            elif t == "tool.result":
+                serialized = d.get("result_serialized")
+                if not serialized:
+                    raw = d.get("result")
+                    serialized = "" if raw is None else str(raw)
+                m._items.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": d.get("id", ""),
+                        "content": serialized,
+                    }
+                )
+            elif t == "system":
+                m._items.append(
+                    {"role": "system", "content": _coerce_content(d.get("content"))}
+                )
+            # tool.call / iteration.end / context.modify / custom: skipped
         return m
 
 

@@ -36,9 +36,16 @@ from .errors import (
     MaxToolIterationsError,
     RateLimitError,
     ServerError,
-    SessionError,
-    SessionTimeoutError,
+    TerminalError,
+    TerminalTimeoutError,
     TransportError,
+)
+from .events import Event, EventType
+from .executor import (
+    CredentialProvider,
+    ExecutionResult,
+    LocalToolExecutor,
+    ToolExecutor,
 )
 from .messages import (
     AudioContent,
@@ -66,7 +73,8 @@ from .responses import (
     Usage,
     WhisperResponse,
 )
-from .session import AsyncSession, CommandResult, Session
+from .session import AsyncSession, Session
+from .terminal import AsyncTerminal, CommandResult, Terminal, TerminalSnapshot
 from .whisper import whisper, whisper_async
 
 __all__ = [
@@ -107,9 +115,21 @@ __all__ = [
     "ServerError",
     "TransportError",
     "MaxToolIterationsError",
+    # Sessions (event log)
     "Session",
     "AsyncSession",
+    "Event",
+    "EventType",
+    # Tool executor seam
+    "ToolExecutor",
+    "LocalToolExecutor",
+    "ExecutionResult",
+    "CredentialProvider",
+    # Terminals (renamed from Session)
+    "Terminal",
+    "AsyncTerminal",
+    "TerminalSnapshot",
     "CommandResult",
-    "SessionError",
-    "SessionTimeoutError",
+    "TerminalError",
+    "TerminalTimeoutError",
 ]

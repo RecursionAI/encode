@@ -1,140 +1,171 @@
-"""Real bash integration tests for Session and AsyncSession.
-
-No mocks — these spawn actual /bin/bash processes. Skipped on Windows.
-"""
+"""Tests for the new Session event-log primitive (Pydantic-only)."""
 
 from __future__ import annotations
 
-import os
-import sys
-import time
-
-import pytest
+import json
+from datetime import datetime
 
 import encode
-
-pytestmark = pytest.mark.skipif(
-    sys.platform.startswith("win"),
-    reason="encode.Session is macOS/Linux only",
-)
+from encode import Event, EventType, Session
 
 
-# --------------------------- sync ---------------------------
+def test_open_creates_session_with_id_and_empty_events():
+    s = Session.open()
+    assert s.id
+    assert isinstance(s.id, str)
+    assert s.events == []
+    assert s.last_event_id == -1
 
 
-def test_run_basic():
-    with encode.Session() as sh:
-        r = sh.run("echo hello")
-    assert r.output == "hello"
-    assert r.exit_code == 0
-    assert r.timed_out is False
-    assert r.duration_ms >= 0
+def test_open_accepts_custom_id_and_metadata():
+    s = Session.open("my-session", metadata={"owner": "jackson"})
+    assert s.id == "my-session"
+    assert s.metadata == {"owner": "jackson"}
 
 
-def test_state_persists_cwd():
-    target = os.path.realpath("/tmp")
-    with encode.Session() as sh:
-        sh.run("cd /tmp")
-        r = sh.run("pwd")
-    assert os.path.realpath(r.output) == target
-    assert os.path.realpath(r.cwd) == target
+def test_emit_assigns_monotonic_ids():
+    s = Session.open()
+    e1 = s.emit("user.message", {"content": "hello"})
+    e2 = s.emit("assistant.message", {"content": "hi"})
+    e3 = s.emit("user.message", {"content": "again"})
+    assert e1.id == 0
+    assert e2.id == 1
+    assert e3.id == 2
+    assert s.last_event_id == 2
 
 
-def test_state_persists_env():
-    with encode.Session() as sh:
-        sh.run("export FOO=bar")
-        r = sh.run("echo $FOO")
-    assert r.output == "bar"
-    assert r.exit_code == 0
+def test_emit_sets_timestamp_and_data():
+    s = Session.open()
+    before = datetime.now().astimezone().timestamp()
+    e = s.emit("user.message", {"content": "hi"})
+    after = datetime.now().astimezone().timestamp()
+    assert before <= e.ts.timestamp() <= after + 1
+    assert e.type == "user.message"
+    assert e.data == {"content": "hi"}
 
 
-def test_nonzero_exit_code():
-    with encode.Session() as sh:
-        r = sh.run("false")
-    assert r.exit_code == 1
+def test_emit_with_prebuilt_event():
+    s = Session.open()
+    ev = Event.user_message("hi")
+    appended = s.emit(ev)
+    assert appended.id == 0
+    assert appended.type == EventType.USER_MESSAGE
 
 
-def test_constructor_cwd_honored(tmp_path):
-    with encode.Session(cwd=tmp_path) as sh:
-        r = sh.run("pwd")
-    assert os.path.realpath(r.output) == os.path.realpath(str(tmp_path))
+def test_emit_rejects_event_plus_data():
+    s = Session.open()
+    import pytest
+
+    with pytest.raises(TypeError):
+        s.emit(Event.user_message("hi"), {"extra": True})
 
 
-def test_run_timeout_raises():
-    with encode.Session() as sh:
-        with pytest.raises(encode.SessionTimeoutError) as excinfo:
-            sh.run("sleep 5", timeout=0.5)
-    assert excinfo.value.command == "sleep 5"
-    assert excinfo.value.partial_output is not None
+def test_events_since_returns_only_newer():
+    s = Session.open()
+    for i in range(5):
+        s.emit("custom", {"i": i})
+    after = s.events_since(2)
+    assert [e.id for e in after] == [3, 4]
 
 
-def test_kill_is_idempotent():
-    sh = encode.Session()
-    assert sh.alive is True
-    sh.kill()
-    sh.kill()  # second call must not raise
-    assert sh.alive is False
+def test_events_by_type_filters():
+    s = Session.open()
+    s.emit("user.message", {"content": "a"})
+    s.emit("assistant.message", {"content": "b"})
+    s.emit("user.message", {"content": "c"})
+    users = s.events_by_type("user.message")
+    assert [e.data["content"] for e in users] == ["a", "c"]
 
 
-def test_context_manager_terminates():
-    with encode.Session() as sh:
-        assert sh.alive is True
-    assert sh.alive is False
-    assert sh.pid is None
+def test_events_slice_positional_window():
+    s = Session.open()
+    for i in range(10):
+        s.emit("custom", {"i": i})
+    window = s.events_slice(3, 6)
+    assert [e.id for e in window] == [3, 4, 5]
 
 
-def test_start_and_read_background_process():
-    with encode.Session() as sh:
-        sh.start("for i in 1 2 3; do echo line$i; done")
-        # The loop runs to completion quickly; give bash a moment to flush.
-        time.sleep(0.3)
-        out = sh.read(timeout=0.5)
-    assert "line1" in out
-    assert "line3" in out
+def test_model_dump_validate_round_trip_preserves_log():
+    s = Session.open("sid-1", metadata={"k": "v"})
+    s.emit(*("user.message", {"content": "hi"}))
+    s.emit(*("assistant.message", {"content": "yo"}))
+    raw = s.model_dump()
+    # serialize through JSON the way a DB would
+    blob = json.dumps(raw, default=str)
+    parsed = json.loads(blob)
+    s2 = Session.model_validate(parsed)
+    assert s2.id == s.id
+    assert s2.metadata == s.metadata
+    assert [(e.id, e.type, e.data) for e in s2.events] == [
+        (e.id, e.type, e.data) for e in s.events
+    ]
 
 
-def test_alive_pid_reflect_state():
-    sh = encode.Session()
-    try:
-        assert sh.alive is True
-        assert isinstance(sh.pid, int)
-    finally:
-        sh.kill()
-    assert sh.alive is False
-    assert sh.pid is None
+def test_to_messages_projects_standard_events():
+    s = Session.open()
+    s.emit("system", {"content": "be brief"})
+    s.emit("user.message", {"content": "hi"})
+    s.emit("assistant.message", {"content": "hello", "tool_calls": None})
+    msgs = s.to_messages()
+    assert len(msgs) == 3
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[2]["content"] == "hello"
 
 
-def test_session_error_is_courier_error():
-    assert issubclass(encode.SessionError, encode.CourierError)
-    assert issubclass(encode.SessionTimeoutError, encode.SessionError)
+def test_to_messages_skips_bookkeeping_events():
+    s = Session.open()
+    s.emit("user.message", {"content": "hi"})
+    s.emit("tool.call", {"id": "c1", "name": "f", "arguments": {}, "iteration": 0})
+    s.emit("iteration.end", {"iteration": 0, "had_tool_calls": True, "finish_reason": None})
+    s.emit("context.modify", {"by": "intercept", "summary": "trimmed"})
+    msgs = s.to_messages()
+    # only the user message survives
+    assert len(msgs) == 1
+    assert msgs[0]["role"] == "user"
 
 
-# --------------------------- async ---------------------------
+def test_to_messages_projects_tool_result_with_id():
+    s = Session.open()
+    s.emit("assistant.message", {
+        "content": None,
+        "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}],
+    })
+    s.emit("tool.result", {"id": "c1", "result": {"ok": True}, "result_serialized": '{"ok": true}'})
+    msgs = s.to_messages()
+    assert len(msgs) == 2
+    assert msgs[1]["role"] == "tool"
+    assert msgs[1]["tool_call_id"] == "c1"
+    assert msgs[1]["content"] == '{"ok": true}'
 
 
-async def test_async_run_basic():
-    async with encode.AsyncSession() as sh:
-        r = await sh.run("echo hello")
-    assert r.output == "hello"
-    assert r.exit_code == 0
+def test_to_messages_transform_runs_before_projection():
+    s = Session.open()
+    for i in range(5):
+        s.emit("user.message", {"content": f"msg {i}"})
+
+    def keep_last_two(events):
+        return events[-2:]
+
+    msgs = s.to_messages(transform=keep_last_two)
+    assert len(msgs) == 2
+    assert msgs[0]["content"] == "msg 3"
+    assert msgs[1]["content"] == "msg 4"
 
 
-async def test_async_state_persists():
-    async with encode.AsyncSession() as sh:
-        await sh.run("export X=ok")
-        r = await sh.run("echo $X")
-    assert r.output == "ok"
+def test_event_factories_build_correct_shapes():
+    e = Event.tool_call(id="c1", name="f", arguments={"x": 1}, iteration=2)
+    assert e.type == "tool.call"
+    assert e.data == {"id": "c1", "name": "f", "arguments": {"x": 1}, "iteration": 2}
+
+    e2 = Event.tool_result(id="c1", result={"ok": True}, result_serialized='{"ok": true}', duration_ms=12.5)
+    assert e2.type == "tool.result"
+    assert e2.data["duration_ms"] == 12.5
+    assert e2.data["error"] is None
 
 
-async def test_async_run_timeout_raises():
-    async with encode.AsyncSession() as sh:
-        with pytest.raises(encode.SessionTimeoutError):
-            await sh.run("sleep 5", timeout=0.5)
-
-
-async def test_async_context_manager():
-    sh = encode.AsyncSession()
-    async with sh:
-        await sh.run("echo hi")
-        assert sh.alive is True
-    assert sh.alive is False
+def test_session_is_exported_from_top_level():
+    assert encode.Session is Session
+    assert encode.Event is Event
+    assert encode.EventType is EventType
