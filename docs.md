@@ -99,11 +99,13 @@ async for event in AsyncRelayHandle: ...
 
 # Sessions (durable event log)
 encode.Session.open(id=None, metadata=None, tools=None)
-encode.Session.resume(data, tools=())     # model_validate + rebind_tools
+encode.Session.model_validate(data)        # auto-rebinds tools from event log
+encode.Session.resume(data, tools=())      # ↑ same; tools= for unresolvable overrides
 encode.AsyncSession.open(...)
 encode.AsyncSession.resume(data, tools=())
 # Per-session tool registry (append-only, idempotent by name)
 session.tools                              # list[Any], excluded from model_dump
+session.unresolved_tools                   # list[str] — names that couldn't auto-rebind
 session.register_tool(fn_or_dict)          # returns True if newly added
 session.register_tools([...])              # bulk, returns count newly added
 session.rebind_tools([...])                # returns list[str] of unmatched names

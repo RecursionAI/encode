@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "courier-encode"
-version = "0.1.4"
+version = "0.1.41"
 description = "Python SDK for OpenAI-compatible inference endpoints (Courier and friends) with auto tool-call loops, structured outputs, and Whisper."
 readme = "README.md"
 requires-python = ">=3.10"

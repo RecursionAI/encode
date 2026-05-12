@@ -24,12 +24,13 @@ processes.
 
 from __future__ import annotations
 
+import importlib
 import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from .events import Event, EventType
 
@@ -46,6 +47,72 @@ def _new_session_id() -> str:
 
 
 EventTransform = Callable[[list[Event]], list[Event]]
+
+
+def _capture_import_path(tool: Any) -> str | None:
+    """Return ``"module:qualname"`` if a callable can plausibly be re-imported.
+
+    Returns ``None`` for raw dict tools, lambdas, inner functions (qualnames
+    containing ``<lambda>`` or ``<locals>``), and callables defined in
+    ``__main__`` (which won't round-trip across processes). These will land in
+    :attr:`Session.unresolved_tools` on resume — users supply them manually if
+    needed via :meth:`Session.rebind_tools`.
+    """
+    if not callable(tool) or isinstance(tool, dict):
+        return None
+    try:
+        module = tool.__module__
+        qualname = tool.__qualname__
+    except AttributeError:
+        return None
+    if not module or not qualname:
+        return None
+    if "<" in qualname:
+        return None
+    if module == "__main__":
+        return None
+    return f"{module}:{qualname}"
+
+
+def _resolve_import_path(path: str) -> Any | None:
+    """Resolve ``"module:qualname"`` to a callable. Returns ``None`` on failure."""
+    if ":" not in path:
+        return None
+    module_name, _, qualname = path.partition(":")
+    try:
+        obj: Any = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            obj = getattr(obj, part)
+    except (ImportError, AttributeError):
+        return None
+    return obj if callable(obj) else None
+
+
+def _try_bind_from_event(ev: Event) -> Any | None:
+    """Best-effort rebinding of a tool entry from its ``tool.registered`` event.
+
+    Dispatches on the event's ``is_callable`` flag (set at registration time):
+
+    - **Callable origin** + ``import_path`` resolves → return the callable.
+    - **Callable origin** without a usable ``import_path`` (lambda, closure,
+      ``__main__``, moved module) → return ``None`` so the name lands in
+      :attr:`Session.unresolved_tools`.
+    - **Dict origin** → return a fresh copy of the captured schema dict so
+      raw-dict tool registrations round-trip exactly.
+
+    Returns ``None`` when the event payload is malformed.
+    """
+    data = ev.data or {}
+    is_callable = bool(data.get("is_callable", False))
+    if is_callable:
+        import_path = data.get("import_path")
+        if import_path:
+            return _resolve_import_path(str(import_path))
+        return None
+    schema = data.get("schema")
+    if isinstance(schema, dict) and schema:
+        return dict(schema)
+    return None
 
 
 class Session(BaseModel):
@@ -73,9 +140,16 @@ class Session(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     # Runtime-only tool registry. Excluded from model_dump because Python
     # callables aren't JSON-serializable; the durable record lives in the
-    # ``tool.registered`` events. Use ``register_tool`` / ``rebind_tools`` /
-    # ``Session.resume(data, tools=...)`` to manage this list.
+    # ``tool.registered`` events. On ``model_validate``, a post-validator
+    # walks the event log and re-imports each callable via its captured
+    # ``import_path`` — so ``Session.model_validate(db.load(sid))`` returns a
+    # session with ``tools`` fully populated for the common case.
     tools: list[Any] = Field(default_factory=list, exclude=True)
+
+    # Names from ``tool.registered`` events that couldn't be auto-re-bound on
+    # resume (typically lambdas, closures, ``__main__`` functions, or moved
+    # callables). Excluded from model_dump — purely a diagnostic surface.
+    _unresolved_tool_names: list[str] = PrivateAttr(default_factory=list)
 
     # ------------------------- write (append-only) -------------------------
 
@@ -101,14 +175,69 @@ class Session(BaseModel):
         self.updated_at = ev.ts
         return ev
 
+    # ------------------------- resume / auto-rebind -------------------------
+
+    @model_validator(mode="after")
+    def _auto_rebind_tools(self) -> Session:
+        """Re-populate ``self.tools`` from ``tool.registered`` events.
+
+        Runs after every Session construction (both ``model_validate`` and a
+        direct ``__init__``). Walks the event log in order; for each unique
+        registered name not already bound, tries to resolve a callable from
+        the event's ``import_path`` (or falls back to the captured schema
+        dict for raw-dict tools). Names that can't be resolved go into
+        :attr:`unresolved_tools` — the validator never raises.
+
+        Idempotent: if a name is already present in ``self.tools`` (typically
+        because the user just called ``register_tool`` during normal runtime
+        flow), it is skipped.
+        """
+        from . import tools as _tools
+
+        bound: set[str] = {_tools.tool_name(t) for t in self.tools}
+        unresolved: list[str] = []
+        seen: set[str] = set()
+        for ev in self.events:
+            if ev.type != EventType.TOOL_REGISTERED:
+                continue
+            name = str((ev.data or {}).get("name") or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if name in bound:
+                continue
+            tool = _try_bind_from_event(ev)
+            if tool is not None:
+                self.tools.append(tool)
+                bound.add(name)
+            else:
+                unresolved.append(name)
+        self._unresolved_tool_names = unresolved
+        return self
+
+    @property
+    def unresolved_tools(self) -> list[str]:
+        """Names from the ``tool.registered`` log that couldn't be auto-bound.
+
+        Typically lambdas, closures, ``__main__``-scope functions, or
+        callables whose module path changed since registration. Supply them
+        manually via :meth:`rebind_tools` if you need them.
+        """
+        return list(self._unresolved_tool_names)
+
     # ------------------------- tool registry (append-only) -------------------------
 
     def register_tool(self, tool: Any, *, by: str = "user") -> bool:
         """Register a tool on the session. Append-only and idempotent.
 
         Adds ``tool`` to ``self.tools`` and emits a ``tool.registered`` event
-        carrying the model-facing schema. If a tool with the same name is
-        already registered, the call is a no-op and returns ``False``.
+        carrying the model-facing schema and (for cleanly importable
+        callables) an ``import_path`` of the form ``"module:qualname"``. That
+        path is what enables :meth:`Session.model_validate` to automatically
+        rebind callables on resume.
+
+        If a tool with the same name is already registered, the call is a
+        no-op and returns ``False``.
 
         ``by`` records the origin of the registration in the event payload
         (``"user"``, ``"intercept"``, ``"resume"``, or any custom string).
@@ -127,7 +256,18 @@ class Session(BaseModel):
                 return False
         schema = _tools.tool_schema(tool)
         self.tools.append(tool)
-        self.emit(EventType.TOOL_REGISTERED, {"name": name, "schema": schema, "by": by})
+        is_callable = callable(tool) and not isinstance(tool, dict)
+        payload: dict[str, Any] = {
+            "name": name,
+            "schema": schema,
+            "by": by,
+            "is_callable": is_callable,
+        }
+        if is_callable:
+            import_path = _capture_import_path(tool)
+            if import_path is not None:
+                payload["import_path"] = import_path
+        self.emit(EventType.TOOL_REGISTERED, payload)
         return True
 
     def register_tools(self, tools: Iterable[Any], *, by: str = "user") -> int:
@@ -246,15 +386,18 @@ class Session(BaseModel):
         *,
         tools: Iterable[Any] = (),
     ) -> Session:
-        """Round-trip helper: ``model_validate(data)`` + ``rebind_tools(tools)``.
+        """Restore a session from a persisted dump.
 
-        Convenience for restoring a session from a persisted dump and
-        re-binding callables to the names captured in the event log. Names
-        that have no matching callable in ``tools`` are silently skipped — use
-        :meth:`rebind_tools` directly if you need the list of missing names.
+        For the common case (module-level callable tools), this is equivalent
+        to ``cls.model_validate(data)`` — the post-validator auto-rebinds
+        tools from each ``tool.registered`` event's ``import_path``. Pass
+        ``tools=[...]`` to supply callables that can't be auto-resolved
+        (lambdas, closures, ``__main__`` functions) or to override specific
+        names with a different implementation.
         """
         sess = cls.model_validate(data)
-        sess.rebind_tools(tools)
+        if tools:
+            sess.rebind_tools(tools)
         return sess
 
 

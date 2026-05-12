@@ -75,7 +75,7 @@ def test_register_tool_rejects_unnamed_input():
         s.register_tool({"type": "function", "function": {}})
 
 
-def test_tools_field_excluded_from_model_dump():
+def test_tools_field_excluded_from_model_dump_but_auto_rebound():
     s = Session.open(tools=[search, fetch])
     raw = s.model_dump()
     assert "tools" not in raw
@@ -83,51 +83,90 @@ def test_tools_field_excluded_from_model_dump():
     blob = json.dumps(raw, default=str)
     parsed = json.loads(blob)
     s2 = Session.model_validate(parsed)
-    # tools list is empty after resume; events survived
-    assert s2.tools == []
+    # ↓ THE headline UX: model_validate auto-rebinds callables from the event log
+    assert [t.__name__ for t in s2.tools] == ["search", "fetch"]
+    # identity preserved when the original module-level callable is importable
+    assert s2.tools[0] is search
+    assert s2.tools[1] is fetch
+    # original tool.registered events survive (2); auto-rebind doesn't emit new ones
     assert len(s2.events_by_type(EventType.TOOL_REGISTERED)) == 2
+    assert s2.unresolved_tools == []
 
 
-def test_rebind_tools_repopulates_from_event_log():
+def test_auto_rebind_runs_on_plain_model_validate():
     s = Session.open(tools=[search, fetch])
     raw = json.loads(json.dumps(s.model_dump(), default=str))
     s2 = Session.model_validate(raw)
-    missing = s2.rebind_tools([search, fetch, list_tools])
-    assert missing == []
     assert [t.__name__ for t in s2.tools] == ["search", "fetch"]
-    # rebind itself emits new events with by="resume"
-    resume_events = [
-        e for e in s2.events_by_type(EventType.TOOL_REGISTERED) if e.data["by"] == "resume"
-    ]
-    assert len(resume_events) == 2
 
 
-def test_rebind_tools_returns_missing_names():
+def test_session_resume_no_tools_arg_just_works():
     s = Session.open(tools=[search, fetch])
     raw = json.loads(json.dumps(s.model_dump(), default=str))
-    s2 = Session.model_validate(raw)
-    missing = s2.rebind_tools([search])  # fetch not supplied
-    assert missing == ["fetch"]
-    assert [t.__name__ for t in s2.tools] == ["search"]
-
-
-def test_resume_classmethod_round_trip():
-    s = Session.open(tools=[search, fetch])
-    raw = json.loads(json.dumps(s.model_dump(), default=str))
-    s2 = Session.resume(raw, tools=[search, fetch])
+    s2 = Session.resume(raw)
+    assert [t.__name__ for t in s2.tools] == ["search", "fetch"]
     assert s2.id == s.id
+
+
+def test_unresolved_tools_for_unimportable_callable():
+    s = Session.open()
+    anon = lambda x: x  # noqa: E731
+    anon.__name__ = "anon"
+    s.register_tool(anon)
+    raw = json.loads(json.dumps(s.model_dump(), default=str))
+    s2 = Session.model_validate(raw)
+    # lambda can't be re-imported — lands in unresolved_tools, not tools
+    assert s2.tools == []
+    assert s2.unresolved_tools == ["anon"]
+
+
+def test_unresolved_tools_recovered_via_rebind_tools_override():
+    s = Session.open()
+    anon = lambda x: x  # noqa: E731
+    anon.__name__ = "anon"
+    s.register_tool(anon)
+    raw = json.loads(json.dumps(s.model_dump(), default=str))
+    # Supply the callable manually — closures, instance methods, etc.
+    s2 = Session.resume(raw, tools=[anon])
+    assert [getattr(t, "__name__", None) for t in s2.tools] == ["anon"]
+
+
+def test_raw_dict_tool_round_trips_through_auto_rebind():
+    s = Session.open()
+    spec = {
+        "type": "function",
+        "function": {
+            "name": "custom_op",
+            "description": "x",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    }
+    s.register_tool(spec)
+    raw = json.loads(json.dumps(s.model_dump(), default=str))
+    s2 = Session.model_validate(raw)
+    # dict-origin tool comes back as a dict — model still sees the schema
+    assert len(s2.tools) == 1
+    assert s2.tools[0]["function"]["name"] == "custom_op"
+    assert s2.unresolved_tools == []
+
+
+def test_rebind_tools_is_idempotent_against_auto_rebind():
+    s = Session.open(tools=[search, fetch])
+    raw = json.loads(json.dumps(s.model_dump(), default=str))
+    s2 = Session.model_validate(raw)
+    # auto-rebind already populated tools; explicit rebind is a no-op
+    missing = s2.rebind_tools([search, fetch, list_tools])
+    assert missing == []  # everything was already bound by auto-rebind
     assert [t.__name__ for t in s2.tools] == ["search", "fetch"]
 
 
-def test_double_resume_is_safe():
-    s = Session.open(tools=[search])
+def test_double_validate_does_not_duplicate_tools():
+    s = Session.open(tools=[search, fetch])
     raw = json.loads(json.dumps(s.model_dump(), default=str))
-    s2 = Session.resume(raw, tools=[search])
-    # call rebind again — should be a no-op for the bound tool
-    missing = s2.rebind_tools([search])
-    assert missing == []
-    # tools list still has exactly one entry
-    assert len(s2.tools) == 1
+    s2 = Session.model_validate(raw)
+    raw2 = json.loads(json.dumps(s2.model_dump(), default=str))
+    s3 = Session.model_validate(raw2)
+    assert [t.__name__ for t in s3.tools] == ["search", "fetch"]
 
 
 def test_async_session_register_tool():

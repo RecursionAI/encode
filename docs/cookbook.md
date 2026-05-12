@@ -69,27 +69,28 @@ def lookup(q: str) -> dict:
     return {"q": q, "answer": facts.get(q, "unknown")}
 
 # --- first turn ---
-session = encode.Session.open()
+session = encode.Session.open(tools=[lookup])
 out = encode.relay(
     model="gpt-4o-mini",
     messages=[{"role": "user", "content": "look up the capital_of_france"}],
-    tools=[lookup],
     session=session,
+    tools=session.tools,
 ).response
 print("first turn →", out.content)
 
 # Persist however you like
-Path("/tmp/agent.json").write_text(json.dumps(session.model_dump(), default=str))
+Path("/tmp/agent.json").write_text(json.dumps(session.model_dump(mode="json")))
 
 # --- later, in a fresh process ---
 raw = json.loads(Path("/tmp/agent.json").read_text())
 session = encode.Session.model_validate(raw)
+# session.tools is already populated via auto-rebind from the tool.registered event log
 
 out = encode.relay(
     model="gpt-4o-mini",
     messages=[{"role": "user", "content": "what about highest_mountain?"}],
-    tools=[lookup],
     session=session,
+    tools=session.tools,
 ).response
 print("second turn →", out.content)
 print("events on session:", len(session.events))

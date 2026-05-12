@@ -246,30 +246,50 @@ If you pass a different list as `tools=` (i.e. not `session.tools`), `event.regi
 
 Same-name registrations are silently skipped. This makes auto-discovery loops safe to re-trigger: if the model calls `list_tools` twice and returns overlapping specs, only the new names are registered. Both `register_tool(fn)` and `register_tools([...])` return how many entries were *newly* added.
 
-### Resuming with tools
+### Resuming with tools — auto-rebind
 
-`session.model_dump()` does **not** include the live `tools` list — Python callables aren't JSON-serializable. The `tool.registered` events are part of the log, though, so they survive the round-trip. Use `rebind_tools` (or the `Session.resume` convenience class method) to bind your callables back to the session on the other side:
+When you save a session and load it back, **tools auto-restore**. There is no extra step — `Session.model_validate(...)` walks the `tool.registered` event log and re-imports each callable via the `import_path` captured at registration time (`"module:qualname"`).
 
 ```python
-# round-trip — anything that survives JSON works
-raw = json.dumps(session.model_dump(), default=str)
+# Save once
+db.save(sid, session.model_dump(mode="json"))
 
-# Method 1: one-liner via Session.resume
-session = encode.Session.resume(json.loads(raw), tools=[search, list_tools])
+# Resume — tools restored automatically
+session = encode.Session.model_validate(db.load(sid))
 
-# Method 2: split into validate + rebind
-session = encode.Session.model_validate(json.loads(raw))
-missing = session.rebind_tools([search, list_tools])
-if missing:
-    print(f"missing callables for: {missing}")   # names from the log without a binding
-
-# Continue the run
-encode.relay(model="m", messages=[...], session=session, tools=session.tools).response
+encode.relay(
+    model="m",
+    messages=[{"role": "user", "content": "continue"}],
+    session=session,
+    tools=session.tools,                # already populated
+).response
 ```
 
-`rebind_tools` walks `tool.registered` events in order, matches each name against the callables you supplied (by `__name__` for functions, `function.name` / `name` for dicts), and registers them with `by="resume"`. It's idempotent: calling it twice on the same session is safe.
+The runtime `session.tools` list is `Field(exclude=True)` (Python callables aren't JSON), but the events that drive it round-trip cleanly — so the durable record is the source of truth.
 
-Async parity: `aregister_tool` / `aregister_tools` / `arebind_tools` on `AsyncSession`, and `AsyncSession.resume`.
+#### When auto-rebind doesn't apply
+
+A callable can be re-imported across processes only if its module + qualname are resolvable. Three things land in `session.unresolved_tools` instead of `session.tools`:
+
+- **Lambdas / inner functions** — qualname contains `<lambda>` or `<locals>`.
+- **`__main__`-scope callables** — script-level `def` in a file run as `python my_script.py`. Move tools into a module that gets imported.
+- **Callables whose module path changed** between save and load (rename / refactor).
+
+Supply those manually via `Session.resume(data, tools=[...])` or `session.rebind_tools([...])` after load. Both register the supplied callables under their `__name__`; matching ones override / fill in unresolved entries.
+
+```python
+session = encode.Session.model_validate(data)
+if session.unresolved_tools:
+    session.rebind_tools([my_closure_tool, refactored_fn])
+# or, one-shot:
+session = encode.Session.resume(data, tools=[my_closure_tool, refactored_fn])
+```
+
+Async parity: `aregister_tool` / `aregister_tools` / `arebind_tools` on `AsyncSession`, and `AsyncSession.resume`. The post-validator is inherited from `Session`, so `AsyncSession.model_validate(...)` auto-rebinds too.
+
+#### Trust model
+
+`Session.model_validate` calls `importlib.import_module(...)` on the path stored in each event. If your Session dumps come from an attacker-controlled source, the attacker can cause arbitrary modules to be imported. Same caveat as deserializing any persisted Python data — don't load Session dumps you don't trust.
 
 ## Custom events
 

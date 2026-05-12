@@ -53,7 +53,8 @@ class Event(BaseModel):
     - ``tool.call``         : ``{"id": str, "name": str, "arguments": dict, "iteration": int}``
     - ``tool.result``       : ``{"id": str, "result": Any, "result_serialized": str,
                                   "error": str | None, "duration_ms": float}``
-    - ``tool.registered``   : ``{"name": str, "schema": dict, "by": str}``
+    - ``tool.registered``   : ``{"name": str, "schema": dict, "by": str,
+                                   "is_callable": bool, "import_path": str | None}``
     - ``iteration.end``     : ``{"iteration": int, "had_tool_calls": bool,
                                   "finish_reason": str | None}``
     - ``context.modify``    : ``{"by": str, "summary": str, ...}``
@@ -136,11 +137,18 @@ class Event(BaseModel):
         name: str,
         schema: dict[str, Any],
         by: str = "user",
+        is_callable: bool = True,
+        import_path: str | None = None,
     ) -> Event:
-        return cls(
-            type=EventType.TOOL_REGISTERED,
-            data={"name": name, "schema": dict(schema), "by": by},
-        )
+        data: dict[str, Any] = {
+            "name": name,
+            "schema": dict(schema),
+            "by": by,
+            "is_callable": is_callable,
+        }
+        if import_path is not None:
+            data["import_path"] = import_path
+        return cls(type=EventType.TOOL_REGISTERED, data=data)
 
     @classmethod
     def iteration_end(
